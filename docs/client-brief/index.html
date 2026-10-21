@@ -1,0 +1,291 @@
+<title>YAL ClearVoice for Call Centers</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@500;700&family=Hanken+Grotesk:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one reading column for the brief; screenshots and the signal chain
+   break out wider; the summary note mirrors what the app writes after a call. */
+:root {
+  --bg: #fcfcfc;
+  --surface: #f2f7f7;
+  --ink: #1a2626;
+  --muted: #5c6b6b;
+  --line: #d9e4e4;
+  --teal: #00989c;
+  --teal-ink: #007376;
+  --teal-wash: #e3f3f3;
+  --display: "Schibsted Grotesk", "Segoe UI", system-ui, sans-serif;
+  --body: "Hanken Grotesk", "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #101818; --surface: #172222; --ink: #e4eded; --muted: #9db0b0; --line: #2a3a3a;
+    --teal: #2cb9bd; --teal-ink: #5fd0d3; --teal-wash: #133234; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #101818; --surface: #172222; --ink: #e4eded; --muted: #9db0b0; --line: #2a3a3a;
+  --teal: #2cb9bd; --teal-ink: #5fd0d3; --teal-wash: #133234; color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body {
+  background: var(--bg); color: var(--ink);
+  font: 16px/1.6 var(--body);
+  padding-inline: 20px; padding-block: 48px 72px;
+}
+.page { max-width: 1000px; margin: 0 auto; display: grid; gap: 56px; }
+.col { max-width: 720px; }
+h1, h2, h3 { font-family: var(--display); text-wrap: balance; margin: 0; line-height: 1.2; }
+h1 { font-size: clamp(2.1rem, 5vw, 3rem); font-weight: 700; letter-spacing: -0.01em; }
+h2 { font-size: 1.5rem; font-weight: 700; }
+h3 { font-size: 1.05rem; font-weight: 700; }
+p { margin: 0; }
+section { display: grid; gap: 18px; min-width: 0; }
+.label {
+  font: 500 0.75rem/1 var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--teal-ink);
+}
+.lede { font-size: 1.2rem; color: var(--muted); max-width: 640px; }
+.muted { color: var(--muted); }
+.small { font-size: 0.9rem; }
+
+header { display: grid; gap: 14px; }
+.facts { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; }
+.fact {
+  font: 500 0.85rem/1 var(--mono); padding: 8px 12px; border-radius: 999px;
+  background: var(--teal-wash); color: var(--teal-ink);
+}
+
+/* The four things the app does. */
+.features { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 28px 36px; }
+.feature { display: grid; gap: 8px; align-content: start; padding-top: 16px; border-top: 2px solid var(--teal); }
+.feature p { color: var(--muted); }
+@media (max-width: 640px) { .features { grid-template-columns: 1fr; } }
+
+/* Signal chain: where the agent's voice goes. */
+.chain { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.node {
+  padding: 10px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface);
+  font-weight: 500; display: grid; gap: 2px;
+}
+.node small { font: 400 0.75rem/1.3 var(--mono); color: var(--muted); }
+.node.ours { border-color: var(--teal); background: var(--teal-wash); }
+.arrow { color: var(--muted); font-family: var(--mono); }
+
+/* Screenshots. */
+figure { margin: 0; display: grid; gap: 10px; }
+figure img {
+  width: 100%; height: auto; display: block; border-radius: 10px;
+  border: 1px solid var(--line); box-shadow: 0 10px 30px rgba(16, 40, 40, 0.10);
+}
+figcaption { font-size: 0.9rem; color: var(--muted); }
+
+/* Agent steps: a real sequence, so numbered. */
+ol.steps { list-style: none; counter-reset: step; padding: 0; margin: 0; display: grid; gap: 14px; }
+ol.steps li { counter-increment: step; display: grid; grid-template-columns: 2.2rem minmax(0, 1fr); gap: 12px; }
+ol.steps li::before {
+  content: counter(step); font: 500 0.95rem/2rem var(--mono); text-align: center;
+  width: 2rem; height: 2rem; border-radius: 50%; background: var(--teal-wash); color: var(--teal-ink);
+}
+.btn-name { font-weight: 600; white-space: nowrap; }
+
+/* The after-call note, as the app writes it. */
+.note {
+  background: var(--surface); border: 1px solid var(--line); border-radius: 12px;
+  padding: 20px 22px; display: grid; gap: 12px; max-width: 720px;
+}
+.note dl { margin: 0; display: grid; grid-template-columns: 9.5rem minmax(0, 1fr); gap: 10px 16px; }
+.note dt { font: 500 0.8rem/1.6 var(--mono); color: var(--teal-ink); }
+.note dd { margin: 0; }
+@media (max-width: 560px) { .note dl { grid-template-columns: 1fr; gap: 2px; } .note dd { margin-bottom: 8px; } }
+
+/* Where call data goes. */
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; min-width: 560px; font-size: 0.95rem; }
+th, td { text-align: left; vertical-align: top; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+th { font: 500 0.75rem/1.2 var(--mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+td:first-child { font-weight: 600; }
+.stay { color: var(--teal-ink); font-weight: 600; }
+
+ul.plain { margin: 0; padding-left: 1.2rem; display: grid; gap: 8px; }
+.qa { display: grid; gap: 20px; }
+.qa div { display: grid; gap: 4px; }
+.qa p { color: var(--muted); }
+code { font: 0.88em var(--mono); background: var(--surface); padding: 1px 5px; border-radius: 4px; }
+footer { border-top: 1px solid var(--line); padding-top: 20px; }
+</style>
+
+<div class="page">
+
+  <header class="col">
+    <span class="label">For call-center teams</span>
+    <h1>YAL ClearVoice</h1>
+    <p class="lede">A Windows app for call-center agents. It removes background noise from the agent's voice, writes down calls as they happen, and turns each call into short notes.</p>
+    <div class="facts">
+      <span class="fact">≈ 50 ms added delay</span>
+      <span class="fact">English · Hindi · Indian languages</span>
+      <span class="fact">Works with your calling software</span>
+    </div>
+  </header>
+
+  <section>
+    <h2>What it does</h2>
+    <div class="features">
+      <div class="feature">
+        <h3>Removes background noise from the agent's voice</h3>
+        <p>An AI model cleans the agent's microphone before the customer hears it. It removes nearby agents talking, keyboards, fans and street noise, and leaves the agent's voice. This runs on the agent's PC, on every call, from the moment the app is open.</p>
+      </div>
+      <div class="feature">
+        <h3>Live transcript, when the agent wants one</h3>
+        <p>The agent clicks <span class="btn-name">Start transcription</span>, and both sides of the call appear as text as people speak: the customer's words and the agent's. It understands English, Hindi and other Indian languages.</p>
+      </div>
+      <div class="feature">
+        <h3>Notes after every call</h3>
+        <p>When the agent clicks <span class="btn-name">Stop transcription</span>, the app writes a short summary within a few seconds: why the customer called, the key details, what was done and what happens next. One click copies it, ready to paste into your CRM or ticket.</p>
+      </div>
+      <div class="feature">
+        <h3>A searchable call history</h3>
+        <p>Finished calls can be saved on the agent's PC. Under <span class="btn-name">Previous calls</span>, agents search past calls by any word, such as an order number, and read or copy them again.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>It fits in front of your calling software</h2>
+    <p class="col muted">The app doesn't replace your softphone, dialer, Zoom or Teams. It sits between the agent's headset and that software. Setup makes the cleaned voice Windows' default microphone, so calling apps that use the default microphone pick it up with no changes. An app set to one particular microphone needs "CABLE Output" chosen once in its audio settings.</p>
+    <div class="chain" role="img" aria-label="Headset microphone, then YAL ClearVoice noise removal, then the virtual cable, then your calling software, then the customer">
+      <div class="node">Headset microphone<small>agent's voice + office noise</small></div>
+      <span class="arrow">→</span>
+      <div class="node ours">YAL ClearVoice<small>AI removes the noise</small></div>
+      <span class="arrow">→</span>
+      <div class="node">VB-CABLE<small>virtual microphone</small></div>
+      <span class="arrow">→</span>
+      <div class="node">Your calling software<small>softphone, dialer, Zoom, Teams</small></div>
+      <span class="arrow">→</span>
+      <div class="node">Customer<small>hears a clean voice</small></div>
+    </div>
+    <p class="col muted small">If your headsets have their own noise reduction, nothing changes: the headset works first and the app cleans what's left.</p>
+  </section>
+
+  <section>
+    <h2>An agent's call, step by step</h2>
+    <ol class="steps col">
+      <li><p>YAL ClearVoice opens by itself when Windows starts. Leave it open: noise removal runs on every call without anything to click.</p></li>
+      <li><p>When a call starts, click <span class="btn-name">Start transcription</span> if you want it written down.</p></li>
+      <li><p>Talk as usual. The customer's words appear on the right, with yours in grey.</p></li>
+      <li><p>At the end, click <span class="btn-name">Stop transcription</span>. The summary appears below within a few seconds.</p></li>
+      <li><p>Click <span class="btn-name">Copy</span> and paste the notes wherever you record calls.</p></li>
+    </ol>
+    <figure>
+      <img src="img/during-call.png" alt="The YAL ClearVoice window during a call: the Detecta headset is selected, noise removal is active, and the live transcript shows the customer's and agent's words.">
+      <figcaption>During a call: noise removal is active, and the transcript fills in as people speak. Example call with made-up details.</figcaption>
+    </figure>
+    <figure>
+      <img src="img/after-call.png" alt="The same window after Stop transcription: the full transcript, including a Hindi line, and the after-call summary below it.">
+      <figcaption>After Stop: the full transcript, including a line spoken in Hindi, and the summary written by the app.</figcaption>
+    </figure>
+  </section>
+
+  <section>
+    <h2>The notes the app writes</h2>
+    <p class="col muted">Every summary uses the same five headings, so notes look the same across agents. This is the summary the app wrote for the example call above, unedited.</p>
+    <div class="note">
+      <span class="label">After-call summary</span>
+      <dl>
+        <dt>Reason for call</dt>
+        <dd>Customer is reporting a duplicate charge on their credit card bill for an order placed last week.</dd>
+        <dt>Key details</dt>
+        <dd>Order number 457812, date October 3, amount 2,499 rupees, refund reference RF9921.</dd>
+        <dt>What was done</dt>
+        <dd>The agent acknowledged the duplicate charge and raised a refund request for the customer.</dd>
+        <dt>Follow-up</dt>
+        <dd>None</dd>
+        <dt>Customer mood</dt>
+        <dd>Neutral</dd>
+      </dl>
+    </div>
+    <p class="col muted small">Summaries and transcripts are written by AI, so agents should check names, numbers and amounts before saving them to your records.</p>
+  </section>
+
+  <section>
+    <h2>Past calls</h2>
+    <figure>
+      <img src="img/previous-calls.png" alt="The Previous calls window: a list of saved calls on the left and the selected call's summary and transcript on the right, with Search, Copy and Open folder.">
+      <figcaption>Previous calls: search by any word, read the call again, copy it.</figcaption>
+    </figure>
+    <ul class="plain col">
+      <li>Calls are saved when the agent clicks Stop, while <span class="btn-name">Save calls</span> is ticked. Untick it to stop saving.</li>
+      <li>Each call is one text file on the agent's PC, in a folder private to their Windows account and not copied to OneDrive.</li>
+      <li>Each agent sees only their own PC's calls. Saved calls stay until someone deletes them.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Where call data goes</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>What</th><th>Where it goes</th><th>When</th></tr></thead>
+        <tbody>
+          <tr><td>Agent's voice, for noise removal</td><td><span class="stay">Stays on the PC</span></td><td>Always</td></tr>
+          <tr><td>Call audio, for the transcript</td><td>Sarvam AI's speech-to-text service</td><td>Only between Start and Stop</td></tr>
+          <tr><td>Transcript, for the summary</td><td>The summary server provided by YAL</td><td>When the agent clicks Stop</td></tr>
+          <tr><td>Saved calls (text)</td><td><span class="stay">Stays on the PC</span></td><td>When Save calls is ticked</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="col muted small">The app never saves call audio, only text. In this test version the connection to the summary server is not encrypted (plain HTTP).</p>
+  </section>
+
+  <section>
+    <h2>Installing it</h2>
+    <p class="col">One file, <code>YAL ClearVoice Setup.exe</code>, installs everything on a PC:</p>
+    <ol class="steps col">
+      <li><p>Plug in the agent's headset.</p></li>
+      <li><p>Double-click <code>YAL ClearVoice Setup.exe</code> and click <span class="btn-name">Install</span>. Windows asks for permission once; if it also asks to install device software from VB-Audio, click <span class="btn-name">Install</span> there too.</p></li>
+      <li><p>Click <span class="btn-name">Restart now</span> when setup asks. After the restart, YAL ClearVoice opens by itself.</p></li>
+    </ol>
+    <p class="col muted small">Setup installs the app, VB-CABLE (the virtual microphone the app uses) and the transcription and summary settings. It sets the headset as the speaker and the cleaned voice as the microphone. To remove it, use Windows Settings, Apps, YAL ClearVoice, Uninstall. That also gives the calling apps the headset microphone back. For many PCs at once, IT can run the setup with <code>/silent</code>.</p>
+  </section>
+
+  <section>
+    <h2>What each PC needs</h2>
+    <ul class="plain col">
+      <li>Windows 10 or 11, 64-bit, and an administrator account to install.</li>
+      <li>A USB headset. We tested with the Detecta 201 USB.</li>
+      <li>An internet connection for transcripts and summaries. Noise removal works without one.</li>
+      <li>Very little computing power: noise removal used about 11% of one processor core in our tests.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Common questions</h2>
+    <div class="qa col">
+      <div>
+        <h3>Will customers notice a delay?</h3>
+        <p>No. The app adds about 50 milliseconds, well below what people notice on a phone call.</p>
+      </div>
+      <div>
+        <h3>What happens if the noise removal stops working?</h3>
+        <p>The call carries on. The agent's voice still reaches the customer, just without the cleaning, and the app's status shows that noise removal isn't active.</p>
+      </div>
+      <div>
+        <h3>Does it record calls?</h3>
+        <p>It never saves audio. It writes text only while the agent has transcription switched on, and keeps that text on the agent's PC if Save calls is ticked.</p>
+      </div>
+      <div>
+        <h3>What if an agent forgets to click Stop?</h3>
+        <p>Transcription stops by itself after 10 minutes with nobody speaking.</p>
+      </div>
+      <div>
+        <h3>Windows warns "Windows protected your PC" when setup starts. Is that expected?</h3>
+        <p>Yes, in this test version. The setup isn't digitally signed yet, so Windows asks once. Click More info, then Run anyway.</p>
+      </div>
+    </div>
+  </section>
+
+  <footer class="col muted small">
+    YAL ClearVoice · test version, October 2026 · Windows 10 and 11
+  </footer>
+
+</div>

@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  YAL ClearVoice installer (WiX v4/v5). Per-machine, x64, elevated.
+  Build inputs (already built + signed) are passed as variables:
+    StageDir  = folder with clearvoice.exe, YalClearVoice.exe, yalcv-supervisor.exe,
+                yalcv-devnode.exe, DeepFilterNet3_onnx.tar.gz
+    DriverDir = folder with the SIGNED yalcv.sys, yalcv.inf, yalcv.cat
+  See README.md. Keep UpgradeCode stable forever; let Version drive upgrades.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="YAL ClearVoice" Manufacturer="YAL" Version="0.1.0"
+           UpgradeCode="7a1c2d64-9e3f-4b8a-9c21-0b5e6f7a0001"
+           Scope="perMachine" Compressed="yes">
+
+    <!-- Upgrade: install the new version, then remove the old. The devnode is
+         preserved across upgrades (see RemoveDriver's condition). -->
+    <MajorUpgrade Schedule="afterInstallExecute"
+                  DowngradeErrorMessage="A newer version of YAL ClearVoice is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- 64-bit Windows only. The Windows 10 1809+ floor is enforced by the driver
+         package itself; document it as a deployment prerequisite. -->
+    <Launch Condition="VersionNT64"
+            Message="YAL ClearVoice requires 64-bit Windows 10 or 11." />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="YAL ClearVoice">
+        <Directory Id="DriverDir" Name="driver" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AppShortcutDir" Name="YAL ClearVoice" />
+    </StandardDirectory>
+
+    <!-- Application, service, engine, model, helper, config, autostart. -->
+    <ComponentGroup Id="Product" Directory="INSTALLFOLDER">
+      <Component Id="Engine">
+        <File Id="EngineExe" Source="$(var.StageDir)\clearvoice.exe" />
+      </Component>
+      <Component Id="Model">
+        <File Source="$(var.StageDir)\DeepFilterNet3_onnx.tar.gz" />
+      </Component>
+      <Component Id="Supervisor">
+        <File Id="SupervisorExe" Source="$(var.StageDir)\yalcv-supervisor.exe" />
+        <ServiceInstall Id="SupervisorSvc" Name="YalClearVoice"
+                        DisplayName="YAL ClearVoice Audio Service"
+                        Description="Launches and supervises the YAL ClearVoice audio engine."
+                        Type="ownProcess" Start="auto" ErrorControl="normal"
+                        Account="LocalSystem" Vital="yes" />
+        <ServiceControl Id="SupervisorSvcCtl" Name="YalClearVoice"
+                        Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+      </Component>
+      <Component Id="Ui">
+        <File Id="UiExe" Source="$(var.StageDir)\YalClearVoice.exe" />
+      </Component>
+      <Component Id="Devnode">
+        <File Id="DevnodeExe" Source="$(var.StageDir)\yalcv-devnode.exe" />
+      </Component>
+      <Component Id="Config">
+        <RegistryKey Root="HKLM" Key="SOFTWARE\YAL\ClearVoice">
+          <RegistryValue Name="InstallFolder" Type="string" Value="[INSTALLFOLDER]" />
+          <RegistryValue Name="ModelPath" Type="string"
+                         Value="[INSTALLFOLDER]DeepFilterNet3_onnx.tar.gz" />
+        </RegistryKey>
+      </Component>
+      <Component Id="Autostart">
+        <!-- Per-machine Run key: the UI starts for each user at logon, in their session. -->
+        <RegistryValue Root="HKLM" Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+                       Name="YalClearVoice" Type="string"
+                       Value="&quot;[INSTALLFOLDER]YalClearVoice.exe&quot;" />
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="DriverFiles" Directory="DriverDir">
+      <Component Id="DriverPkg">
+        <File Source="$(var.DriverDir)\yalcv.sys" />
+        <File Source="$(var.DriverDir)\yalcv.inf" />
+        <File Source="$(var.DriverDir)\yalcv.cat" />
+      </Component>
+    </ComponentGroup>
+
+    <Component Id="Shortcut" Directory="AppShortcutDir">
+      <Shortcut Id="UiShortcut" Name="YAL ClearVoice"
+                Target="[INSTALLFOLDER]YalClearVoice.exe" WorkingDirectory="INSTALLFOLDER" />
+      <RemoveFolder Id="AppShortcutDir" On="uninstall" />
+      <RegistryValue Root="HKLM" Key="SOFTWARE\YAL\ClearVoice" Name="shortcut"
+                     Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <Feature Id="Main" Title="YAL ClearVoice">
+      <ComponentGroupRef Id="Product" />
+      <ComponentGroupRef Id="DriverFiles" />
+      <ComponentRef Id="Shortcut" />
+    </Feature>
+
+    <!-- Driver lifecycle via the bundled helper, deferred and as SYSTEM.
+         install  = create the devnode (if absent) + bind the driver (idempotent).
+         remove   = delete the devnode. -->
+    <CustomAction Id="InstallDriver" FileRef="DevnodeExe" ExeCommand="install"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="RollbackDriver" FileRef="DevnodeExe" ExeCommand="remove"
+                  Execute="rollback" Impersonate="no" Return="ignore" />
+    <CustomAction Id="RemoveDriver" FileRef="DevnodeExe" ExeCommand="remove"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <InstallExecuteSequence>
+      <!-- Install/upgrade: after files land, before the service starts. The rollback
+           action is queued first so a failed InstallDriver undoes a fresh devnode. -->
+      <Custom Action="RollbackDriver" After="InstallFiles" Condition="NOT Installed" />
+      <Custom Action="InstallDriver" After="RollbackDriver" Condition="NOT Installed" />
+      <!-- True uninstall only: skip during an upgrade (UPGRADINGPRODUCTCODE set), so
+           the devnode and its endpoint identity survive version changes. -->
+      <Custom Action="RemoveDriver" Before="RemoveFiles"
+              Condition="(REMOVE=&quot;ALL&quot;) AND (NOT UPGRADINGPRODUCTCODE)" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

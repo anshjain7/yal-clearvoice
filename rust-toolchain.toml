@@ -1,0 +1,4 @@
+# DeepFilterNet's inference kernels (tract-linalg) are assembled with MSVC's
+# ml64.exe and lib.exe on Windows, upstream's supported toolchain.
+[toolchain]
+channel = "stable-x86_64-pc-windows-msvc"

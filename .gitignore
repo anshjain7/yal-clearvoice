@@ -1,0 +1,22 @@
+# Build output
+/target/
+/ui/YalClearVoice.exe
+/installer/setup/out/
+*.pdb
+
+# Settings hold the Sarvam and summary-server keys: never commit them.
+# (A built setup embeds them too, which is why installer/setup/out is ignored.)
+settings.ini
+setup-settings.ini
+
+# Recordings, transcripts and notes are call data, not code.
+*.wav
+Recordings/
+Transcripts/
+
+# Editors and OS
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

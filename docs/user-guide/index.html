@@ -1,0 +1,388 @@
+<title>YAL ClearVoice User Guide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@600;700&family=Hanken+Grotesk:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one column read top to bottom, in the order a new agent meets the
+   app: install, set up, daily use, then fixing problems. Numbered steps carry
+   real order, markers on the window picture match the legend under it, and
+   what the app or Windows shows on screen is set in mono. */
+:root {
+  --bg: #fcfcfc;
+  --surface: #f2f7f7;
+  --ink: #1a2626;
+  --muted: #5c6b6b;
+  --line: #d9e4e4;
+  --teal: #00989c;
+  --teal-ink: #007376;
+  --teal-wash: #e3f3f3;
+  --display: "Schibsted Grotesk", "Segoe UI", system-ui, sans-serif;
+  --body: "Hanken Grotesk", "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #101818; --surface: #172222; --ink: #e4eded; --muted: #9db0b0; --line: #2a3a3a;
+    --teal: #2cb9bd; --teal-ink: #5fd0d3; --teal-wash: #133234; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #101818; --surface: #172222; --ink: #e4eded; --muted: #9db0b0; --line: #2a3a3a;
+  --teal: #2cb9bd; --teal-ink: #5fd0d3; --teal-wash: #133234; color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font: 16px/1.6 var(--body); padding-inline: 20px; padding-block: 44px 72px; }
+.page { max-width: 760px; margin: 0 auto; display: grid; gap: 48px; }
+h1, h2, h3 { font-family: var(--display); text-wrap: balance; margin: 0; line-height: 1.2; }
+h1 { font-size: clamp(2rem, 5vw, 2.6rem); font-weight: 700; }
+h2 { font-size: 1.4rem; font-weight: 700; }
+h3 { font-size: 1.05rem; font-weight: 600; }
+p { margin: 0; }
+a { color: var(--teal-ink); }
+a:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; border-radius: 3px; }
+section { display: grid; gap: 16px; min-width: 0; scroll-margin-top: 16px; }
+.label { font: 500 0.75rem/1 var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--teal-ink); }
+.lede { font-size: 1.12rem; color: var(--muted); }
+b { font-weight: 600; }
+/* What the app or Windows shows on screen. */
+.ui { font: 500 0.88em var(--mono); background: var(--surface); border: 1px solid var(--line); padding: 1px 6px; border-radius: 5px; white-space: nowrap; }
+.screen { font-family: var(--mono); font-size: 0.9rem; color: var(--teal-ink); }
+.path { font-family: var(--mono); font-size: 0.9rem; color: var(--teal-ink); overflow-wrap: anywhere; }
+
+/* Contents: the guide's sections, in reading order. */
+nav.contents { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 18px 22px; display: grid; gap: 10px; }
+nav.contents ol { margin: 0; padding-left: 1.4rem; columns: 2 16rem; column-gap: 32px; }
+nav.contents li { break-inside: avoid; padding-block: 2px; }
+nav.contents li::marker { font: 500 0.85rem var(--mono); color: var(--teal-ink); }
+
+ul.dots { list-style: none; padding: 0; margin: 0; display: grid; gap: 10px; }
+ul.dots li { display: grid; grid-template-columns: 1rem minmax(0, 1fr); gap: 8px; }
+ul.dots li::before { content: ""; width: 0.45rem; height: 0.45rem; margin-top: 0.62rem; border-radius: 50%; background: var(--teal); }
+
+/* Numbered: steps done in order (big) and the window legend (matches the markers). */
+ol.steps, ol.legend { list-style: none; padding: 0; margin: 0; display: grid; }
+ol.steps { counter-reset: step; gap: 20px; }
+ol.legend { counter-reset: mark; gap: 12px; }
+ol.steps > li, ol.legend > li { display: grid; gap: 12px; }
+ol.steps > li { counter-increment: step; grid-template-columns: 2.2rem minmax(0, 1fr); }
+ol.legend > li { counter-increment: mark; grid-template-columns: 1.8rem minmax(0, 1fr); }
+ol.steps > li::before, ol.legend > li::before {
+  font: 500 0.9rem/1 var(--mono); display: grid; place-items: center; border-radius: 50%;
+  background: var(--teal); color: var(--bg);
+}
+ol.steps > li::before { content: counter(step); width: 2rem; height: 2rem; }
+ol.legend > li::before { content: counter(mark); width: 1.6rem; height: 1.6rem; font-size: 0.8rem; margin-top: 0.1rem; }
+.step { display: grid; gap: 8px; min-width: 0; }
+.note { border-left: 3px solid var(--teal-wash); padding-left: 12px; color: var(--muted); font-size: 0.95rem; }
+.group { display: grid; gap: 10px; }
+
+figure { margin: 0; display: grid; gap: 8px; }
+figure img { width: 100%; height: auto; display: block; border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 8px 24px rgba(16, 40, 40, 0.10); }
+figure.small img { max-width: 506px; }
+figcaption { font-size: 0.85rem; color: var(--muted); }
+
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; min-width: 520px; font-size: 0.95rem; }
+th, td { text-align: left; vertical-align: top; padding: 11px 12px; border-bottom: 1px solid var(--line); }
+th { font: 500 0.75rem/1.2 var(--mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+td:first-child { width: 38%; }
+</style>
+
+<div class="page">
+
+  <header style="display:grid;gap:12px">
+    <span class="label">User guide</span>
+    <h1>YAL ClearVoice User Guide</h1>
+    <p class="lede">YAL ClearVoice removes background noise from your voice on every call. It can also write down a call as it happens, save a short summary note when you're done, and record calls. This guide covers everything, from installing it to fixing problems.</p>
+  </header>
+
+  <nav class="contents" aria-label="Contents">
+    <span class="label">Contents</span>
+    <ol>
+      <li><a href="#install">Installing</a></li>
+      <li><a href="#update">Updating to a new version</a></li>
+      <li><a href="#calling-software">Setting up your calling software</a></li>
+      <li><a href="#window">The window at a glance</a></li>
+      <li><a href="#noise">Noise removal</a></li>
+      <li><a href="#transcript">Writing down a call</a></li>
+      <li><a href="#notes">Summary notes</a></li>
+      <li><a href="#past-calls">Finding a past call</a></li>
+      <li><a href="#recording">Recording calls</a></li>
+      <li><a href="#clear-voice">Keeping your voice clear</a></li>
+      <li><a href="#problems">If something isn't right</a></li>
+      <li><a href="#removing">Removing it</a></li>
+      <li><a href="#privacy">Where your calls go</a></li>
+    </ol>
+  </nav>
+
+  <section id="install">
+    <h2>Installing</h2>
+    <p>Do this once on each PC. It takes a few minutes and sometimes one restart.</p>
+    <div class="group">
+      <h3>Before you start</h3>
+      <ul class="dots">
+        <li><p>A Windows 10 or 11 PC (64-bit), and an administrator account on it. Windows asks for permission once.</p></li>
+        <li><p>The agent's USB headset, plugged in. Setup picks it up by itself.</p></li>
+        <li><p>The file <b>YAL ClearVoice Setup.exe</b> (about 14 MB), from the link you were sent.</p></li>
+        <li><p>The calling software (softphone, dialer, Zoom, Teams) closed, if it's open.</p></li>
+      </ul>
+    </div>
+    <h3>Install it</h3>
+    <ol class="steps">
+      <li><div class="step">
+        <p>Download <b>YAL ClearVoice Setup.exe</b>. Your browser saves it in the Downloads folder.</p>
+      </div></li>
+      <li><div class="step">
+        <p>Open Downloads and double-click <b>YAL ClearVoice Setup.exe</b>.</p>
+        <p class="note">If you see <span class="screen">Windows protected your PC</span>, click <span class="ui">More info</span>, then <span class="ui">Run anyway</span>.</p>
+        <p class="note">When Windows asks <span class="screen">Do you want to allow this app from an unknown publisher to make changes to your device?</span>, click <span class="ui">Yes</span>. If it asks for a password, use the administrator's.</p>
+      </div></li>
+      <li><div class="step">
+        <p>In the setup window, click <span class="ui">Install</span>.</p>
+        <p class="note">The app goes in <span class="path">C:\Program Files\YAL ClearVoice</span>. To put it somewhere else, click <span class="ui">Change…</span> first and choose a folder; setup makes a YAL ClearVoice folder inside it.</p>
+        <figure class="small">
+          <img src="img/setup-window.png" alt="The YAL ClearVoice Setup window, listing what it installs, with the install folder, a Change button, and Install and Cancel buttons.">
+          <figcaption>The setup window.</figcaption>
+        </figure>
+      </div></li>
+      <li><div class="step">
+        <p>If Windows asks <span class="screen">Would you like to install this device software?</span> from VB-Audio, click <span class="ui">Install</span>. This is VB-CABLE, the virtual microphone YAL ClearVoice uses.</p>
+      </div></li>
+      <li><div class="step">
+        <p>Wait while setup works. It shows each step underneath. Don't close the window.</p>
+      </div></li>
+      <li><div class="step">
+        <p>If setup says <span class="screen">Restart the PC to finish setting up VB-CABLE</span>, save any open work and click <span class="ui">Restart now</span>. If it says <span class="screen">YAL ClearVoice is installed</span>, click <span class="ui">Open YAL ClearVoice</span>.</p>
+      </div></li>
+    </ol>
+    <div class="group">
+      <h3>Check that it works</h3>
+      <ul class="dots">
+        <li><p>The YAL ClearVoice window opens by itself after you sign in to Windows.</p></li>
+        <li><p>Under Status, <b>Connection</b> says <span class="screen">Connected</span> and <b>Noise removal (AI)</b> says <span class="screen">Active</span>.</p></li>
+        <li><p>Next to <b>Headset</b> is the headset's name, for example <span class="screen">Detecta 201 USB</span>.</p></li>
+        <li><p>Make a test call. The other person should hear you clearly, without the office noise.</p></li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="update">
+    <h2>Updating to a new version</h2>
+    <ol class="steps">
+      <li><div class="step">
+        <p>Double-click the new <b>YAL ClearVoice Setup.exe</b> and click <span class="ui">Install</span>. It closes YAL ClearVoice if it's open and updates the copy that's already installed, in the same folder.</p>
+      </div></li>
+      <li><div class="step">
+        <p>Click <span class="ui">Open YAL ClearVoice</span> when it's done.</p>
+      </div></li>
+    </ol>
+    <p class="note">Saved calls, summary notes and recordings are kept. Updating doesn't change your calling software's settings.</p>
+  </section>
+
+  <section id="calling-software">
+    <h2>Setting up your calling software</h2>
+    <p>Do this once, in the audio or device settings of the software you take calls in:</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Setting</th><th>Choose</th></tr></thead>
+        <tbody>
+          <tr><td>Microphone (also called Input)</td><td><span class="ui">CABLE Output (VB-Audio Virtual Cable)</span>, or <span class="ui">Default</span></td></tr>
+          <tr><td>Speaker (also called Output or Headphones)</td><td>Your headset, for example <span class="ui">Speakers (Detecta 201 USB)</span></td></tr>
+          <tr><td>Noise suppression, noise cancellation or background noise removal</td><td>Off, if the software has it</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <ul class="dots">
+      <li><p><b>CABLE Output is your cleaned voice.</b> YAL ClearVoice listens to your headset microphone, removes the noise, and passes your voice on as CABLE Output. <span class="ui">Default</span> works too, because setup made CABLE Output Windows' default microphone.</p></li>
+      <li><p>Don't choose your headset's own microphone, such as <span class="ui">Microphone (Detecta 201 USB)</span>. The customer would then hear you without noise removal.</p></li>
+      <li><p>Turn the calling software's own noise suppression off. YAL ClearVoice already removes the noise, and two noise removers on one voice can make it sound choppy.</p></li>
+      <li><p>In YAL ClearVoice itself, leave Microphone on <span class="ui">Automatic</span>. It picks your headset microphone.</p></li>
+    </ul>
+  </section>
+
+  <section id="window">
+    <h2>The window at a glance</h2>
+    <figure>
+      <img src="img/window-tour.png" alt="The YAL ClearVoice window after a call, with numbered markers on its ten parts: devices, noise cancellation, status, live transcript, the Start transcription button, Previous calls, Save calls, the after-call summary, the summary notes folder, and call recording.">
+      <figcaption>An example call with made-up details.</figcaption>
+    </figure>
+    <ol class="legend">
+      <li><p><b>Devices.</b> Microphone is the one in use; <span class="ui">Automatic</span> picks your headset. Headset is where you hear the customer. Leave Output as it is.</p></li>
+      <li><p><b>Noise cancellation.</b> While it's ticked, background noise is removed from your voice. Leave it ticked.</p></li>
+      <li><p><b>Status.</b> <span class="screen">Connected</span> means the app is working. Noise removal (AI) shows <span class="screen">Active</span> while it cleans your voice. Latency is the small delay it adds; under 100 ms is normal.</p></li>
+      <li><p><b>Live transcript.</b> The call written down as it happens: the customer in teal, you in grey.</p></li>
+      <li><p><b>Start transcription / Stop transcription.</b> Starts and ends writing down a call.</p></li>
+      <li><p><b>Previous calls.</b> Opens your saved calls.</p></li>
+      <li><p><b>Save calls.</b> While it's ticked, each call is saved on this PC when you stop.</p></li>
+      <li><p><b>After-call summary.</b> Short notes written when you stop. <span class="ui">Copy</span> puts them on the clipboard.</p></li>
+      <li><p><b>Summary notes.</b> The folder where every summary is saved by itself, with <span class="ui">Change…</span> and <span class="ui">Open folder</span>.</p></li>
+      <li><p><b>Call recording.</b> Records each transcribed call, you and the customer in one file. <span class="ui">Open recordings</span> shows them.</p></li>
+    </ol>
+    <ul class="dots">
+      <li><p>YAL ClearVoice opens by itself when you sign in to Windows. If it's closed, open it from the Desktop or the Start menu.</p></li>
+      <li><p>Keep it open during calls. You can minimize it, but don't close it: while it's closed, the customer can't hear you.</p></li>
+    </ul>
+  </section>
+
+  <section id="noise">
+    <h2>Noise removal</h2>
+    <p>Noise removal works on every call by itself, as long as the app is open and Noise cancellation is ticked. The <b>Noise removal (AI)</b> box tells you what it's doing:</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>It says</th><th>What it means</th></tr></thead>
+        <tbody>
+          <tr><td><span class="screen">Active</span></td><td>Background noise is being removed from your voice.</td></tr>
+          <tr><td><span class="screen">Off</span></td><td>Noise cancellation is unticked. Tick it to turn noise removal back on.</td></tr>
+          <tr><td><span class="screen">Starting…</span></td><td>The app has just opened. It becomes Active within a few seconds.</td></tr>
+          <tr><td><span class="screen">Paused (PC busy)</span></td><td>The PC is too busy for a moment. Noise removal comes back by itself after a few seconds. Close programs you don't need.</td></tr>
+          <tr><td><span class="screen">Stopped (error)</span></td><td>Noise removal stopped working. Between calls, close YAL ClearVoice and open it again.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">Whatever it says, the customer still hears you. Only when it says Active is your voice also cleaned.</p>
+  </section>
+
+  <section id="transcript">
+    <h2>Writing down a call</h2>
+    <ol class="steps">
+      <li><div class="step">
+        <p>When the call starts, click <span class="ui">Start transcription</span>. The button turns dark and changes to <span class="ui">Stop transcription</span>.</p>
+      </div></li>
+      <li><div class="step">
+        <p>Talk as usual. The customer's words appear next to <b>Customer</b>, yours in grey next to <b>You</b>. Words still being spoken show in italics under the box.</p>
+        <figure>
+          <img src="img/during-call.png" alt="The YAL ClearVoice window during a call: the transcript shows the customer's and agent's lines, words still being spoken in Hindi appear in italics underneath, and Call recording shows Recording this call.">
+          <figcaption>During a call, with call recording on. It understands English, Hindi and other Indian languages.</figcaption>
+        </figure>
+      </div></li>
+      <li><div class="step">
+        <p>When the call ends, click <span class="ui">Stop transcription</span>.</p>
+      </div></li>
+      <li><div class="step">
+        <p>A few seconds later, the summary appears under <b>After-call summary</b>, under five headings: Reason for call, Key details, What was done, Follow-up, Customer mood. It's saved by itself as a note. To paste it into your CRM or ticket, click <span class="ui">Copy</span>.</p>
+      </div></li>
+    </ol>
+    <ul class="dots">
+      <li><p>Check names, numbers and amounts before you use them. The transcript and summary are written by a computer and can mishear.</p></li>
+      <li><p>If you forget to click Stop, transcription stops by itself after 10 minutes with nobody speaking.</p></li>
+      <li><p>Clicking Start again begins a new transcript. The last call stays under Previous calls if Save calls is ticked.</p></li>
+    </ul>
+  </section>
+
+  <section id="notes">
+    <h2>Summary notes</h2>
+    <p>Every summary is saved by itself as a note, so there's nothing to copy and save by hand.</p>
+    <ul class="dots">
+      <li><p>Notes go to the folder shown under <b>Summary notes are saved to</b>. At first that's <span class="path">Documents\YAL ClearVoice\Summary notes</span>.</p></li>
+      <li><p>To use another folder, such as a shared team folder, click <span class="ui">Change…</span> and choose it. <span class="ui">Open folder</span> shows the notes.</p></li>
+      <li><p>Each note is a text file named by the call's date and time and your Windows name, for example <span class="path">2026-10-14 10-32-05 Priya.txt</span>. It holds the call's time, your name and the summary.</p></li>
+      <li><p>After each call, <span class="screen">Note saved at 10:41</span> appears next to the buttons. If the folder can't be reached, for example a network folder while offline, it says so; the summary is still in the window and under Previous calls.</p></li>
+    </ul>
+  </section>
+
+  <section id="past-calls">
+    <h2>Finding a past call</h2>
+    <ul class="dots">
+      <li><p>Click <span class="ui">Previous calls</span>. The list shows each call's time and the customer's first words, newest first.</p></li>
+      <li><p>To find a call, type any word from it in <b>Search</b>, such as an order or reference number.</p></li>
+      <li><p><span class="ui">Copy</span> copies the selected call's summary and transcript.</p></li>
+    </ul>
+    <figure>
+      <img src="img/previous-calls.png" alt="The Previous calls window: a searchable list of saved calls on the left and the selected call's summary and transcript on the right.">
+      <figcaption>Previous calls, with the example call selected.</figcaption>
+    </figure>
+    <div class="group">
+      <h3>Saved calls outside the app</h3>
+      <p>Every saved call is also a text file on this PC, which you can open in Notepad or copy elsewhere. Each is named by the date and time the call started, for example <span class="path">2026-10-13 13-59-28.txt</span>, with the summary first and then the full transcript. To find them:</p>
+      <ul class="dots">
+        <li><p><b>From the app:</b> click <span class="ui">Previous calls</span>, then <span class="ui">Open folder</span>.</p></li>
+        <li><p><b>From Windows:</b> press the Windows key and R together, type <span class="ui">%LOCALAPPDATA%\YAL ClearVoice\Transcripts</span> and press Enter.</p></li>
+      </ul>
+      <p class="note">Calls are saved only on this PC, and never deleted by themselves; delete a file to remove that call. Untick <b>Save calls</b> to stop saving new ones.</p>
+    </div>
+  </section>
+
+  <section id="recording">
+    <h2>Recording calls</h2>
+    <p>YAL ClearVoice can record your calls: you and the customer together, in one audio file per call. Recordings stay on this PC, and nothing is sent anywhere by itself.</p>
+    <ol class="steps">
+      <li><div class="step">
+        <p>Tick <span class="ui">Record call audio</span> and read the message. Click <span class="ui">Yes</span> to agree.</p>
+      </div></li>
+      <li><div class="step">
+        <p>Take calls as usual, with <span class="ui">Start transcription</span> and <span class="ui">Stop transcription</span>. Each transcribed call is recorded from Start to Stop, and the window shows <span class="screen">● Recording this call</span>.</p>
+      </div></li>
+      <li><div class="step">
+        <p>To listen, click <span class="ui">Open recordings</span>. Each call is one file, named by the date and time it started, for example <span class="path">2026-10-14 10-32-05.wav</span>. Double-click it to play it.</p>
+      </div></li>
+      <li><div class="step">
+        <p>Untick <span class="ui">Record call audio</span> when you no longer want calls recorded. It also switches off whenever YAL ClearVoice is closed.</p>
+      </div></li>
+    </ol>
+    <ul class="dots">
+      <li><p>Next to each recording is a small log, for example <span class="path">2026-10-14 10-32-05 log.csv</span>. It notes, second by second, what the app was doing during the call. You don't need to open it; it's for YAL, to find the cause if a call didn't sound right.</p></li>
+    </ul>
+    <p class="note">Only record calls where the customer has been told the call may be recorded.</p>
+  </section>
+
+  <section id="clear-voice">
+    <h2>Keeping your voice clear</h2>
+    <p>How the customer hears you depends on the whole path: your headset, this PC, the calling software and the internet connection. These help the most:</p>
+    <ul class="dots">
+      <li><p><b>Use your headset.</b> A laptop's own microphone and speakers can make your voice drop out and echo.</p></li>
+      <li><p><b>Turn off the calling software's own noise suppression.</b> Two noise removers on one voice can make it sound choppy.</p></li>
+      <li><p><b>Use a steady internet connection.</b> A network cable is best. On Wi-Fi, use the 5 GHz network if there is one and stay close to the router. A weak connection makes a voice crack or break up for the customer, whatever the PC does.</p></li>
+      <li><p><b>Close programs you don't need.</b> If Noise removal (AI) shows <span class="screen">Paused (PC busy)</span>, the PC is struggling.</p></li>
+    </ul>
+    <div class="group">
+      <h3>If customers say your voice is breaking up or cracking</h3>
+      <ol class="steps">
+        <li><div class="step">
+          <p>Tick <span class="ui">Record call audio</span> for the next few calls.</p>
+        </div></li>
+        <li><div class="step">
+          <p>When a customer mentions it, note roughly when in the call it happened.</p>
+        </div></li>
+        <li><div class="step">
+          <p>Click <span class="ui">Open recordings</span> and send YAL the recording and its log for those calls, with the times you noted.</p>
+        </div></li>
+      </ol>
+      <p class="note">The recording holds your voice exactly as the calling software received it. If it sounds clear there but the customer heard breaks, the cause is after this PC: the calling software or the internet connection.</p>
+    </div>
+  </section>
+
+  <section id="problems">
+    <h2>If something isn't right</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>What you notice</th><th>What to do</th></tr></thead>
+        <tbody>
+          <tr><td>The customer can't hear you</td><td>Make sure YAL ClearVoice is open. In your calling software, the microphone should be <span class="ui">CABLE Output</span> or <span class="ui">Default</span>.</td></tr>
+          <tr><td>The customer says your voice is breaking up or cracking</td><td>See <a href="#clear-voice">Keeping your voice clear</a>.</td></tr>
+          <tr><td>The window says <span class="screen">Check speaker</span>, or you hear nothing</td><td>Open Settings, then System, then Sound. Under Output, choose your headset.</td></tr>
+          <tr><td>Next to Headset it says <span class="screen">None found</span></td><td>Plug in your headset. The window updates within a few seconds.</td></tr>
+          <tr><td>Microphone shows the laptop's microphone, not your headset</td><td>Plug the headset in firmly, or try another USB port. With Microphone on <span class="ui">Automatic</span>, the app switches to the headset by itself.</td></tr>
+          <tr><td>Noise removal (AI) says <span class="screen">Stopped (error)</span></td><td>Between calls, close YAL ClearVoice and open it again.</td></tr>
+          <tr><td>The summary says it couldn't reach the summary server</td><td>The transcript is still in the window: select it and copy it. Tell your supervisor.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="removing">
+    <h2>Removing it</h2>
+    <p>Open Settings, then Apps, then Installed apps (on Windows 10: Apps &amp; features). Find <b>YAL ClearVoice</b>, choose <span class="ui">Uninstall</span>, and restart if asked. Your headset microphone goes back to being the calling software's microphone. Saved calls, summary notes and recordings stay on the PC.</p>
+  </section>
+
+  <section id="privacy">
+    <h2>Where your calls go</h2>
+    <ul class="dots">
+      <li><p>Noise removal happens on this PC. Your voice isn't sent anywhere to be cleaned.</p></li>
+      <li><p>Call audio leaves the PC only while transcription is on, to be written down. When you stop, the written transcript goes to YAL's summary server to write the summary.</p></li>
+      <li><p>Saved calls and recordings stay on this PC, in folders only your Windows account can open.</p></li>
+      <li><p>Summary notes go to the folder you see in the window, which can be a shared folder.</p></li>
+    </ul>
+  </section>
+
+</div>

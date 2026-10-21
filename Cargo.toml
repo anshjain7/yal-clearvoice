@@ -1,0 +1,20 @@
+[package]
+name = "clearvoice"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+# libDF, DeepFilterNet's native runtime. crates.io stops at 0.2.5, so it's pinned
+# to the inspected commit; only the tract inference feature is enabled.
+deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", rev = "d375b2d8309e0935d165700c91da9de862a99c31", default-features = false, features = ["tract"] }
+ndarray = "0.15" # libDF's array types
+# Live transcription: Sarvam's real-time speech-to-text WebSocket (TLS through
+# Windows' own schannel) and its JSON messages.
+serde_json = "1"
+tungstenite = { version = "0.30", default-features = false, features = ["handshake", "native-tls"] }
+# Upstream's lockfile version: later tract moves to ndarray 0.16 and libDF stops compiling.
+tract-core = "=0.21.4"
+# ponytail: 0.59, plus windows-result/windows-strings 0.3.0 held in Cargo.lock, are the last
+# versions that link on the GNU toolchain without dlltool. Bump freely once builds use MSVC.
+windows ={ version = "0.59", features = ["Win32_Devices_FunctionDiscovery", "Win32_Media_Audio", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com_StructuredStorage", "Win32_System_IO", "Win32_System_Performance", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_Variant", "Win32_UI_Shell_PropertiesSystem"] }

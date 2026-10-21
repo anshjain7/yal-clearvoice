@@ -1,0 +1,102 @@
+; yalcv.inf - installs the YAL ClearVoice virtual audio driver and its two
+; endpoints: "YAL ClearVoice Microphone" (capture) and "YAL ClearVoice Speaker"
+; (render).
+;
+; Derived from Microsoft's SimpleAudioSample INF (MS-PL), one root-enumerated
+; device carrying both endpoints. Formats are enforced by the miniport's data
+; ranges, not here: the mic is 48 kHz/16-bit/mono, the speaker 48 kHz/16-bit/stereo
+; (see README.md).
+;
+; VALIDATE before use: run InfVerif (/w /v), set DriverVer, and regenerate the
+; placeholder class GUID in yalcv_control.cpp. Declarative, no co-installers,
+; runs from the DriverStore (dirid 13) so it is attestation-ready.
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = MEDIA
+ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
+CatalogFile = yalcv.cat
+DriverVer   =
+PnpLockdown = 1
+
+[Manufacturer]
+%ManufacturerName% = Yalcv, NT$ARCH$.10.0...17763
+
+; Root-enumerated: the installer creates this devnode once (see README.md).
+[Yalcv.NT$ARCH$.10.0...17763]
+%Yalcv.DeviceDesc% = Yalcv_Install, ROOT\YALCLEARVOICE
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+yalcv.sys = 1
+
+[DestinationDirs]
+DefaultDestDir = 13 ; DriverStore
+
+; ---- Install ---------------------------------------------------------------
+
+[Yalcv_Install.NT]
+CopyFiles = Yalcv_CopyFiles
+
+[Yalcv_CopyFiles]
+yalcv.sys
+
+[Yalcv_Install.NT.Services]
+AddService = yalcv, 0x00000002, Yalcv_Service ; 0x2 = SPSVCINST_ASSOCSERVICE
+
+[Yalcv_Service]
+DisplayName   = %Yalcv.SvcDesc%
+ServiceType   = 1 ; SERVICE_KERNEL_DRIVER
+StartType     = 3 ; SERVICE_DEMAND_START
+ErrorControl  = 1 ; SERVICE_ERROR_NORMAL
+ServiceBinary = %13%\yalcv.sys
+
+; ---- Endpoint registration -------------------------------------------------
+; A capture interface ("YAL ClearVoice Microphone") and a render interface
+; ("YAL ClearVoice Speaker"), each advertised to the audio category plus its own.
+; The PortCls proxy (proxy.clsid) bridges each KS filter to the audio engine. The
+; filters' reference strings (KSNAME_Capture, KSNAME_Render) are defined by the
+; miniport.
+
+[Yalcv_Install.NT.Interfaces]
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_Capture%, Yalcv_Capture
+AddInterface = %KSCATEGORY_CAPTURE%,  %KSNAME_Capture%, Yalcv_Capture
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_Capture%, Yalcv_Capture
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_Render%,  Yalcv_Render
+AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_Render%,  Yalcv_Render
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_Render%,  Yalcv_Render
+
+[Yalcv_Capture]
+AddReg = Yalcv_Capture_AddReg
+
+[Yalcv_Capture_AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Yalcv.Capture.FriendlyName%
+
+[Yalcv_Render]
+AddReg = Yalcv_Render_AddReg
+
+[Yalcv_Render_AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%Yalcv.Render.FriendlyName%
+
+[Strings]
+ProviderName                 = "YAL"
+ManufacturerName             = "YAL"
+DiskName                     = "YAL ClearVoice Installation Disk"
+Yalcv.DeviceDesc             = "YAL ClearVoice"
+Yalcv.SvcDesc                = "YAL ClearVoice Virtual Audio Driver"
+Yalcv.Capture.FriendlyName   = "YAL ClearVoice Microphone"
+Yalcv.Render.FriendlyName    = "YAL ClearVoice Speaker"
+
+; PortCls KS proxy and interface category GUIDs (fixed Windows constants).
+Proxy.CLSID        = "{17CCA71B-ECD7-11D0-B908-00A0C9223196}"
+KSCATEGORY_AUDIO   = "{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_CAPTURE = "{65E8773D-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_RENDER  = "{65E8773E-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_REALTIME = "{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
+KSNAME_Capture     = "Capture"
+KSNAME_Render      = "Render"
