@@ -134,6 +134,10 @@ sealed class MainForm : Form
     readonly CheckBox _record = new() { Text = "Record call audio", AutoSize = true };
     readonly Label _recStatus = new() { AutoSize = true, ForeColor = Muted };
     readonly Button _recOpen = new() { Text = "Open recordings" };
+    // The agent's voice sample, for keeping other voices out of the transcript
+    // (shown only when the engine has a voice server in settings.ini).
+    readonly Button _voiceRec = new() { Text = "Record my voice", Visible = false };
+    readonly Label _voiceStatus = new() { AutoSize = true, ForeColor = Muted, Visible = false };
     volatile bool _recordWanted;   // "Record call audio" ticked (and agreed to)
     int _recordingCall;            // worker thread: the call being recorded, 0 = none
     HistoryForm? _historyForm;
@@ -231,6 +235,14 @@ sealed class MainForm : Form
             _recStatus.Text = _recordWanted ? "On: records each transcribed call" : "";
         };
         _recOpen.Click += (_, _) => OpenFolder(Recordings);
+        _voiceRec.Click += (_, _) =>
+        {
+            if (MessageBox.Show(this, VoicePrompt, "Record my voice",
+                    MessageBoxButtons.OKCancel, MessageBoxIcon.Information) != DialogResult.OK) return;
+            _commands.Enqueue("voice record");
+            _voiceStatus.Text = "● Speak now, for 10 seconds";
+            _voiceStatus.ForeColor = Teal;
+        };
 
         StartEngine();
         // Start talking to the engine once the window exists (UI updates need it).
@@ -245,6 +257,15 @@ sealed class MainForm : Form
     // Call recordings: private to the Windows user, not synced by OneDrive.
     static readonly string Recordings = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "YAL ClearVoice", "Recordings");
+
+    const string VoicePrompt =
+        "To keep other people's voices out of your transcripts, YAL ClearVoice needs "
+        + "10 seconds of your voice.\n\n"
+        + "After you click OK, talk normally for 10 seconds, as on a call. For example, "
+        + "say your name, your team, and read out a phone number. Pick a moment when "
+        + "people near you aren't talking.\n\n"
+        + "Your voice sample is kept on this PC and sent to your company's voice server, "
+        + "which uses it to recognise your voice.";
 
     const string RecordConsent =
         "YAL ClearVoice will record each call you transcribe while \"Record call audio\" "
@@ -389,6 +410,11 @@ sealed class MainForm : Form
         _recOpen.Location = new Point(16, y);
         _recOpen.Size = new Size(120, 26);
         Controls.Add(_recOpen);
+        _voiceRec.Location = new Point(142, y);
+        _voiceRec.Size = new Size(128, 26);
+        Controls.Add(_voiceRec);
+        _voiceStatus.Location = new Point(278, y + 5);
+        Controls.Add(_voiceStatus);
 
         // Right column: the call. Nirmala UI (part of Windows) has Latin and the
         // Indian scripts; Segoe UI in a RichTextBox shows Hindi as empty boxes.
@@ -574,6 +600,17 @@ sealed class MainForm : Form
         long latency = Convert.ToInt64(r["latency_ms"]);
         string micName = r.TryGetValue("mic_name", out var mn) ? mn as string ?? "" : "";
         string headsetName = r.TryGetValue("headset_name", out var hn) ? hn as string ?? "" : "";
+        string voice = r.TryGetValue("voice", out var vo) ? vo as string ?? "off" : "off";
+        var (voiceText, voiceColor) = voice switch
+        {
+            "no_sample" => ("No voice sample yet", Muted),
+            "recording" => ("● Speak now, for 10 seconds", Teal),
+            "ready" => ("Voice sample saved", Muted),
+            "server_down" => ("Voice server not reachable", Ink),
+            "too_quiet" => ("Didn't hear you: try again", Ink),
+            "failed" => ("Couldn't record: try again", Ink),
+            _ => ("", Muted),
+        };
         // The AI that removes background noise from the agent's voice. Whenever it
         // isn't active, the voice still reaches the call, just not cleaned.
         string dfnText = !nc ? "Off" : dfn switch
@@ -631,6 +668,10 @@ sealed class MainForm : Form
                 _spkLocked = true;
             }
             ShowHint(hint, notice != 0);
+            _voiceRec.Visible = _voiceStatus.Visible = voice != "off";
+            _voiceRec.Enabled = voice != "recording";
+            _voiceStatus.Text = voiceText;
+            _voiceStatus.ForeColor = voiceColor;
             _loading = false;
         });
     }

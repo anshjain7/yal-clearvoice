@@ -24,6 +24,7 @@ use clearvoice::record;
 use clearvoice::ring;
 use clearvoice::stream::{self, supervise};
 use clearvoice::transcribe::{self, Side};
+use clearvoice::voice;
 
 const RETRY: Duration = Duration::from_millis(500);
 
@@ -165,7 +166,11 @@ fn main() {
     TELEMETRY.notice.store(ipc::NOTICE_NONE, Relaxed);
 
     let (models, models_rx) = mpsc::channel();
-    match DeepFilter::new(&beside_exe("DeepFilterNet3_onnx.tar.gz")) {
+    // How much noise removal takes out at most: settings.ini's [noise]
+    // attenuation_db, else the default (see denoise.rs).
+    let ini = std::fs::read_to_string(beside_exe("settings.ini")).unwrap_or_default();
+    let attenuation = denoise::attenuation_from_ini(&ini);
+    match DeepFilter::new(&beside_exe("DeepFilterNet3_onnx.tar.gz"), attenuation) {
         Ok(model) => {
             let _ = models.send(model);
         }
@@ -186,13 +191,14 @@ fn main() {
     }
     drop(models);
 
-    // Live transcription runs only when settings.ini has a Sarvam key.
-    let transcription = std::fs::read_to_string(beside_exe("settings.ini"))
-        .ok()
-        .and_then(|ini| transcribe::Settings::parse(&ini));
+    // Live transcription runs only when settings.ini has a Sarvam key; the
+    // agent's side goes through the voice server first when it has one.
+    let transcription = transcribe::Settings::parse(&ini);
     if transcription.is_some() {
         transcribe::enable();
     }
+    let voice_server = voice::Settings::parse(&ini);
+    voice::set_state(voice::initial_state(voice_server.as_ref()));
 
     if !headless {
         println!("YAL ClearVoice is running.");
@@ -270,6 +276,15 @@ fn main() {
             for (side, endpoint) in [(Side::Customer, customer), (Side::Agent, cable_input)] {
                 let (tx, rx) = mpsc::channel();
                 s.spawn(move || transcribe::listen(endpoint, tx, listen_stop));
+                // Only the agent's own voice, when there's a voice server.
+                let rx = match (&voice_server, side) {
+                    (Some(server), Side::Agent) => {
+                        let (clean_tx, clean_rx) = mpsc::channel();
+                        s.spawn(move || voice::clean(server, rx, clean_tx));
+                        clean_rx
+                    }
+                    _ => rx,
+                };
                 s.spawn(move || transcribe::relay(side, settings, rx));
             }
         }
@@ -303,6 +318,12 @@ fn main() {
                     UiCommand::SetSpk(_) => {} // fixed to VB-CABLE in this mode
                     UiCommand::Record(c) => {
                         let _ = rec_tx.send(c);
+                    }
+                    // The cleaned voice, as the transcript hears it.
+                    UiCommand::RecordVoice => {
+                        if TELEMETRY.voice.load(Relaxed) != ipc::VOICE_RECORDING {
+                            s.spawn(|| voice::record_sample(cable_input(), &voice::sample_path()));
+                        }
                     }
                 }
             }

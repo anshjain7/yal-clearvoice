@@ -83,11 +83,13 @@ fn main() -> ExitCode {
         // to the stage, which bypasses until then. A restart is another load.
         let load = move || {
             let models = models.clone();
-            s.spawn(move || match DeepFilter::new(Path::new(MODEL)) {
-                Ok(model) => {
-                    let _ = models.send(model);
+            s.spawn(move || {
+                match DeepFilter::new(Path::new(MODEL), denoise::DEFAULT_ATTENUATION_DB) {
+                    Ok(model) => {
+                        let _ = models.send(model);
+                    }
+                    Err(e) => eprintln!("model    DeepFilterNet3 failed to load: {e:#}"),
                 }
-                Err(e) => eprintln!("model    DeepFilterNet3 failed to load: {e:#}"),
             })
         };
         // Start in pipeline order so nothing queues up as latency: the model,
@@ -236,7 +238,7 @@ fn main() -> ExitCode {
                         out_default.store(true, Relaxed);
                     }
                     // Call recordings exist in the VB-CABLE build only.
-                    UiCommand::Record(_) => {}
+                    UiCommand::Record(_) | UiCommand::RecordVoice => {}
                 }
             }
             ipc::TELEMETRY

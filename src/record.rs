@@ -360,6 +360,13 @@ fn gap(elapsed: Duration, received: u64) -> usize {
     }
 }
 
+/// Writes `samples` (16 kHz mono) to `path` as a WAV file.
+pub(crate) fn write_wav(path: &Path, samples: &[i16]) -> io::Result<()> {
+    let mut wav = Wav::create(path)?;
+    wav.write(samples)?;
+    wav.patch()
+}
+
 /// A 16 kHz mono 16-bit WAV file being written. Its header is rewritten every
 /// 5 s, so a recording cut off by a crash or power cut still plays.
 struct Wav {

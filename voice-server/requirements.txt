@@ -1,0 +1,7 @@
+# Install torch and torchaudio first, the build matching the server's CUDA.
+numpy
+soundfile
+pyyaml
+scipy
+silero-vad
+onnxruntime

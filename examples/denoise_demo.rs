@@ -34,7 +34,7 @@ fn main() {
 
     println!("Loading DeepFilterNet3...");
     let (models, models_rx) = mpsc::channel();
-    match DeepFilter::new(Path::new(MODEL)) {
+    match DeepFilter::new(Path::new(MODEL), denoise::DEFAULT_ATTENUATION_DB) {
         Ok(model) => {
             let _ = models.send(model);
         }

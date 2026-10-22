@@ -12,6 +12,8 @@ ndarray = "0.15" # libDF's array types
 # Live transcription: Sarvam's real-time speech-to-text WebSocket (TLS through
 # Windows' own schannel) and its JSON messages.
 serde_json = "1"
+# The voice server (voice.rs) over https, through the same Windows schannel.
+native-tls = "0.2"
 tungstenite = { version = "0.30", default-features = false, features = ["handshake", "native-tls"] }
 # Upstream's lockfile version: later tract moves to ndarray 0.16 and libDF stops compiling.
 tract-core = "=0.21.4"

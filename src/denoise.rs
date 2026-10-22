@@ -44,6 +44,16 @@ unsafe impl Send for DeepFilter {}
 pub const DEFAULT_DELAY_FRAMES: u64 = 3;
 /// Largest model delay the recent-frame history can line up a dry signal against.
 const MAX_DELAY_FRAMES: u64 = 7;
+/// The most noise DeepFilterNet takes out, in dB, unless settings.ini's
+/// `[noise] attenuation_db` says otherwise. Taking out everything (100, no
+/// limit) also takes the life out of the voice: it sounds muffled, as if in a
+/// closed room, and quiet syllables go with the noise. Headsets like the
+/// Detecta 201 already cut background noise at their noise-cancelling
+/// microphone, so a limit leaves the voice natural and the remaining noise
+/// far down. Below the limit, libDF mixes that much of the original back in.
+pub const DEFAULT_ATTENUATION_DB: f32 = 24.0;
+/// The range settings.ini may set: 6 dB (barely any) to 100 (no limit).
+const ATTENUATION_RANGE: std::ops::RangeInclusive<f32> = 6.0..=100.0;
 /// Model failures in a row before the stage drops the model and bypasses.
 const MAX_FAILURES: u32 = 5;
 /// Frames in a row over the 10 ms budget (or falling behind) before the stage
@@ -328,12 +338,32 @@ impl Watchdog {
     }
 }
 
+/// `[noise] attenuation_db` from settings.ini's text, within 6..=100 dB;
+/// `DEFAULT_ATTENUATION_DB` when it isn't set or isn't a number.
+pub fn attenuation_from_ini(ini: &str) -> f32 {
+    let mut section = "";
+    for line in ini.trim_start_matches('\u{feff}').lines().map(str::trim) {
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            section = name.trim();
+        } else if section == "noise"
+            && let Some((k, v)) = line.split_once('=')
+            && k.trim() == "attenuation_db"
+            && let Ok(db) = v.split(';').next().unwrap_or("").trim().parse::<f32>()
+        {
+            return db.clamp(*ATTENUATION_RANGE.start(), *ATTENUATION_RANGE.end());
+        }
+    }
+    DEFAULT_ATTENUATION_DB
+}
+
 impl DeepFilter {
     /// Loads a model archive (`.tar.gz` of `enc.onnx`, `erb_dec.onnx`,
     /// `df_dec.onnx` and `config.ini`) and initializes the runtime for one
     /// channel: `DfParams::new` then `DfTract::new`. Slow (tract optimizes the
     /// graphs), so call it off the audio threads.
-    pub fn new(model: &Path) -> Result<Self> {
+    /// `attenuation_db` caps how much noise it removes (see
+    /// `DEFAULT_ATTENUATION_DB`); 100 or more removes all it can.
+    pub fn new(model: &Path, attenuation_db: f32) -> Result<Self> {
         // Below `min_db_thresh` of local SNR, libDF treats a frame as noise
         // only and silences it outright. Its default of -10 dB also silences
         // quiet speech in a loud room, heard as the voice cutting out; -15 dB
@@ -341,7 +371,9 @@ impl DeepFilter {
         // thresholds stay at their defaults (raising them costs CPU).
         let model = DfTract::new(
             DfParams::new(model.to_path_buf())?,
-            &RuntimeParams::default_with_ch(1).with_thresholds(-15.0, 30.0, 20.0),
+            &RuntimeParams::default_with_ch(1)
+                .with_thresholds(-15.0, 30.0, 20.0)
+                .with_atten_lim(attenuation_db),
         )?;
         let want = AudioFormat::MIC;
         ensure!(
@@ -398,8 +430,8 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)] // native inference
     fn loads_processes_resets_and_drops() {
-        assert!(DeepFilter::new(Path::new("missing.tar.gz")).is_err());
-        let mut df = DeepFilter::new(Path::new(MODEL)).unwrap();
+        assert!(DeepFilter::new(Path::new("missing.tar.gz"), 100.0).is_err());
+        let mut df = DeepFilter::new(Path::new(MODEL), 100.0).unwrap();
         assert_eq!(
             df.delay_frames, 3,
             "standard DeepFilterNet3 delay is 3 frames"
@@ -459,6 +491,57 @@ mod tests {
         assert!(!(0..=10).rev().any(|waiting| w.frame(ms(3), waiting)));
     }
 
+    #[test]
+    fn attenuation_comes_from_settings_within_range() {
+        let read = attenuation_from_ini;
+        assert_eq!(read(""), DEFAULT_ATTENUATION_DB);
+        assert_eq!(read("[noise]\nattenuation_db = 18 ; Detecta\n"), 18.0);
+        assert_eq!(read("[noise]\nattenuation_db = 2\n"), 6.0);
+        assert_eq!(read("[noise]\nattenuation_db = 300\n"), 100.0);
+        assert_eq!(
+            read("[noise]\nattenuation_db = lots\n"),
+            DEFAULT_ATTENUATION_DB
+        );
+        assert_eq!(
+            read("[summary]\nattenuation_db = 10\n"),
+            DEFAULT_ATTENUATION_DB
+        );
+    }
+
+    /// With a limit, pure noise comes out that far down, not all but gone.
+    #[test]
+    #[cfg_attr(miri, ignore)] // native inference
+    fn attenuation_limit_keeps_noise_that_far_down() {
+        let mut seed = 7u32;
+        let noise: Vec<f32> = (0..300 * 480)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                0.05 * (seed as f32 / u32::MAX as f32 * 2.0 - 1.0)
+            })
+            .collect();
+        let reduction = |db: f32| {
+            let mut df = DeepFilter::new(Path::new(MODEL), db).unwrap();
+            let mut out = vec![0.0; noise.len()];
+            for (i, o) in noise.chunks(480).zip(out.chunks_mut(480)) {
+                df.process(i, o).unwrap();
+            }
+            // The last second, once the model has settled.
+            let rms = |s: &[f32]| (s.iter().map(|x| x * x).sum::<f32>() / s.len() as f32).sqrt();
+            let tail = noise.len() - 48_000..noise.len();
+            20.0 * (rms(&out[tail.clone()]) / rms(&noise[tail])).log10()
+        };
+        let (full, limited) = (reduction(100.0), reduction(24.0));
+        println!("noise reduction: {full:.1} dB without a limit, {limited:.1} dB with 24 dB");
+        assert!(
+            full < -30.0,
+            "without a limit it removes far more: {full:.1} dB"
+        );
+        assert!(
+            (-26.0..=-20.0).contains(&limited),
+            "24 dB limit gave {limited:.1} dB"
+        );
+    }
+
     /// `frames` frames of a continuous 200 Hz tone, starting at phase zero.
     fn tone(frames: usize) -> Vec<AudioFrame> {
         (0..frames)
@@ -475,7 +558,7 @@ mod tests {
     }
 
     fn model() -> DeepFilter {
-        DeepFilter::new(Path::new(MODEL)).unwrap()
+        DeepFilter::new(Path::new(MODEL), 100.0).unwrap()
     }
 
     /// Runs the stage on its own thread and feeds it `frames` one at a time,
@@ -603,7 +686,7 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let started = Instant::now();
-        let mut df = DeepFilter::new(Path::new(MODEL)).unwrap();
+        let mut df = DeepFilter::new(Path::new(MODEL), 100.0).unwrap();
         let load = started.elapsed();
 
         let mut seed = 1u32;

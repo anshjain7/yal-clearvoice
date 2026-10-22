@@ -234,6 +234,11 @@ pub fn end_call() {
     }
 }
 
+/// True while a call is being transcribed.
+pub(crate) fn active() -> bool {
+    call().active
+}
+
 /// The transcript as JSON for the window; see `Call::json`.
 pub fn json(window_call: u32, from: usize) -> String {
     call().json(window_call, from)
@@ -347,7 +352,7 @@ impl Tap {
     }
 }
 
-fn is_speech(chunk: &[i16]) -> bool {
+pub(crate) fn is_speech(chunk: &[i16]) -> bool {
     let energy = chunk.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>();
     let rms = (energy / chunk.len().max(1) as f64).sqrt() / 32768.0;
     20.0 * rms.max(1e-9).log10() > SPEECH_DBFS

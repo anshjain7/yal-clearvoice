@@ -42,6 +42,19 @@ pub const NOTICE_NO_MODEL: u8 = 2;
 /// nothing and PC sounds leak into calls.
 pub const NOTICE_CABLE_IS_SPEAKER: u8 = 3;
 
+/// The agent's voice sample and the voice server, for the UI (`voice`):
+/// no `[voice]` server set up; no sample yet; recording one; ready (the
+/// server answered, or hasn't been needed yet); the server didn't answer
+/// (the transcript uses the original audio meanwhile); the last recording
+/// held too little speech to keep; recording failed.
+pub const VOICE_OFF: u64 = 0;
+pub const VOICE_NO_SAMPLE: u64 = 1;
+pub const VOICE_RECORDING: u64 = 2;
+pub const VOICE_READY: u64 = 3;
+pub const VOICE_SERVER_DOWN: u64 = 4;
+pub const VOICE_TOO_QUIET: u64 = 5;
+pub const VOICE_FAILED: u64 = 6;
+
 /// Live engine telemetry, updated by the audio threads (cheap Relaxed stores) and
 /// read by the IPC thread. A process-wide singleton: there is one engine.
 pub struct Telemetry {
@@ -55,6 +68,8 @@ pub struct Telemetry {
     pub dfn_state: AtomicU8,
     /// One of the NOTICE_* codes.
     pub notice: AtomicU8,
+    /// One of the VOICE_* codes.
+    pub voice: AtomicU64,
     /// End-to-end send-path latency, microseconds (set by the virtual mic).
     pub latency_us: AtomicU64,
     /// DeepFilterNet per-frame processing time, microseconds.
@@ -93,6 +108,7 @@ impl Telemetry {
             spk_selectable: AtomicBool::new(true),
             nc_on: AtomicBool::new(true),
             dfn_state: AtomicU8::new(DFN_BYPASS),
+            voice: AtomicU64::new(VOICE_OFF),
             notice: AtomicU8::new(NOTICE_NONE),
             latency_us: AtomicU64::new(0),
             busy_us: AtomicU64::new(0),
@@ -151,6 +167,8 @@ pub enum UiCommand {
     SetSpk(Option<String>),
     /// A call recording: start (into a file) or stop.
     Record(record::Cmd),
+    /// Record the agent's voice sample (see voice.rs).
+    RecordVoice,
 }
 
 /// Total CPU time this process has used across all threads.
@@ -314,6 +332,10 @@ fn handle(cmd: &str, commands: &Sender<UiCommand>) -> String {
             transcribe::end_call();
             telemetry_json()
         }
+        ("voice", "record") => {
+            send(UiCommand::RecordVoice);
+            telemetry_json()
+        }
         // "rec start <file.wav>", "rec stop": call recordings.
         ("rec", args) => {
             match args.split_once(' ').unwrap_or((args, "")) {
@@ -341,7 +363,7 @@ fn telemetry_json() -> String {
         "{{\"type\":\"telemetry\",\"mic_connected\":{},\"spk_connected\":{},\
          \"spk_selectable\":{},\"nc\":{},\"dfn\":\"{}\",\"notice\":{},\"latency_ms\":{},\
          \"processing_ms\":{:.2},\"cpu_pct\":{},\"errors\":{},\"strength_supported\":false,\
-         \"mic_name\":\"{}\",\"headset_name\":\"{}\"}}",
+         \"mic_name\":\"{}\",\"headset_name\":\"{}\",\"voice\":\"{}\"}}",
         TELEMETRY.mic_connected.load(Relaxed),
         TELEMETRY.spk_connected.load(Relaxed),
         TELEMETRY.spk_selectable.load(Relaxed),
@@ -354,7 +376,20 @@ fn telemetry_json() -> String {
         TELEMETRY.errors(),
         escape(&mic_name),
         escape(&headset_name),
+        voice_name(TELEMETRY.voice.load(Relaxed)),
     )
+}
+
+fn voice_name(state: u64) -> &'static str {
+    match state {
+        VOICE_NO_SAMPLE => "no_sample",
+        VOICE_RECORDING => "recording",
+        VOICE_READY => "ready",
+        VOICE_SERVER_DOWN => "server_down",
+        VOICE_TOO_QUIET => "too_quiet",
+        VOICE_FAILED => "failed",
+        _ => "off",
+    }
 }
 
 fn devices_json() -> String {
@@ -405,12 +440,15 @@ mod tests {
         let reply = handle("nc on", &tx);
         assert!(reply.contains("\"type\":\"telemetry\""));
         assert!(
-            reply.ends_with("\"headset_name\":\"Speakers (Detecta 201 USB)\"}"),
+            reply.contains("\"headset_name\":\"Speakers (Detecta 201 USB)\",")
+                && reply.ends_with("\"voice\":\"off\"}"),
             "{reply}"
         );
         assert!(matches!(rx.try_recv(), Ok(UiCommand::Nc(true))));
         handle("nc off", &tx);
         assert!(matches!(rx.try_recv(), Ok(UiCommand::Nc(false))));
+        handle("voice record", &tx);
+        assert!(matches!(rx.try_recv(), Ok(UiCommand::RecordVoice)));
         handle("mic abc-123", &tx);
         assert!(matches!(rx.try_recv(), Ok(UiCommand::SetMic(Some(id))) if id == "abc-123"));
         handle("mic default", &tx);
