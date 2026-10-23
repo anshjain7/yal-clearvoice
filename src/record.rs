@@ -17,9 +17,9 @@ use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -81,6 +81,22 @@ fn log_path(wav: &Path) -> PathBuf {
     wav.with_file_name(format!("{stem} log.csv"))
 }
 
+/// The call recording in progress, for voice.rs to save the agent's cleaned
+/// voice next to it.
+static RECORDING: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// The call recording in progress (its .wav), if any.
+pub(crate) fn recording() -> Option<PathBuf> {
+    RECORDING.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Where the agent's cleaned voice goes for the recording `wav`:
+/// `2026-10-14 10-32-05.wav` -> `2026-10-14 10-32-05 cleaned voice.wav`.
+pub(crate) fn cleaned_path(wav: &Path) -> PathBuf {
+    let stem = wav.file_stem().unwrap_or_default().to_string_lossy();
+    wav.with_file_name(format!("{stem} cleaned voice.wav"))
+}
+
 /// A side to record: its name, and the device it comes from, if found.
 type SideSource = (&'static str, Direction, Option<String>);
 
@@ -101,6 +117,7 @@ impl Session {
         }
         let wav = Wav::create(path)?;
         let mut log = File::create(log_path(path))?;
+        *RECORDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.to_path_buf());
         writeln!(
             log,
             "seconds,noise_removal,slowest_frame_ms,cpu_percent,latency_ms,\
@@ -201,6 +218,7 @@ impl Session {
     /// Stops both sides and mixes in everything they delivered, the shorter
     /// side padded with silence.
     fn finish(mut self) {
+        *RECORDING.lock().unwrap_or_else(|e| e.into_inner()) = None;
         for side in &mut self.sides {
             side.stop();
         }
@@ -369,14 +387,14 @@ pub(crate) fn write_wav(path: &Path, samples: &[i16]) -> io::Result<()> {
 
 /// A 16 kHz mono 16-bit WAV file being written. Its header is rewritten every
 /// 5 s, so a recording cut off by a crash or power cut still plays.
-struct Wav {
+pub(crate) struct Wav {
     file: File,
     samples: u64,
     header_at: u64,
 }
 
 impl Wav {
-    fn create(path: &Path) -> io::Result<Wav> {
+    pub(crate) fn create(path: &Path) -> io::Result<Wav> {
         let mut file = File::create(path)?;
         file.write_all(&header(0))?;
         Ok(Wav {
@@ -386,7 +404,7 @@ impl Wav {
         })
     }
 
-    fn write(&mut self, samples: &[i16]) -> io::Result<()> {
+    pub(crate) fn write(&mut self, samples: &[i16]) -> io::Result<()> {
         let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
         self.file.write_all(&bytes)?;
         self.samples += samples.len() as u64;
@@ -397,7 +415,7 @@ impl Wav {
     }
 
     /// Writes the current length into the header.
-    fn patch(&mut self) -> io::Result<()> {
+    pub(crate) fn patch(&mut self) -> io::Result<()> {
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(&header(self.samples))?;
         self.file.seek(SeekFrom::End(0))?;
@@ -487,6 +505,14 @@ mod tests {
     }
 
     #[test]
+    fn cleaned_voice_sits_next_to_its_recording() {
+        assert_eq!(
+            cleaned_path(Path::new(r"C:\Rec\2026-10-14 10-32-05.wav")),
+            Path::new(r"C:\Rec\2026-10-14 10-32-05 cleaned voice.wav")
+        );
+    }
+
+    #[test]
     fn log_sits_next_to_its_recording() {
         assert_eq!(
             log_path(Path::new(r"C:\Rec\2026-10-14 10-32-05.wav")),
@@ -528,8 +554,10 @@ mod tests {
             ],
         )
         .unwrap();
+        assert_eq!(recording(), Some(path.clone()));
         s.pump();
         s.finish();
+        assert_eq!(recording(), None);
         let log = fs::read_to_string(dir.join("2026-10-14 10-32-05 log.csv")).unwrap();
         assert!(log.starts_with("seconds,noise_removal,"));
         assert!(

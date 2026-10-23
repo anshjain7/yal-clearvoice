@@ -205,6 +205,8 @@ pub fn clean(backend: &Backend, input: Receiver<Vec<i16>>, out: Sender<Vec<i16>>
     let mut off_until: Option<Instant> = None;
     // How far behind the call extraction has fallen.
     let mut behind = Duration::ZERO;
+    // While the call is also being recorded: its cleaned voice, saved next to it.
+    let mut saver = Saver::default();
     for chunk in input {
         let on = transcribe::active()
             && engine.sample().is_file()
@@ -212,6 +214,7 @@ pub fn clean(backend: &Backend, input: Receiver<Vec<i16>>, out: Sender<Vec<i16>>
         if !on {
             // Audio held for a block that won't be cleaned goes on as it is.
             for c in blocks.flush().chunks(CHUNK).chain([chunk.as_slice()]) {
+                saver.save(engine.sample().is_file(), record::recording(), c);
                 let _ = out.send(c.to_vec());
             }
             blocks.remember(&chunk);
@@ -245,7 +248,38 @@ pub fn clean(backend: &Backend, input: Receiver<Vec<i16>>, out: Sender<Vec<i16>>
             }
         };
         for c in cleaned.chunks(CHUNK) {
+            saver.save(true, record::recording(), c);
             let _ = out.send(c.to_vec());
+        }
+    }
+    saver.save(false, None, &[]);
+}
+
+/// Saves what goes on to the transcript, the agent's cleaned voice, while a
+/// call is being recorded: `<recording> cleaned voice.wav`, next to the call
+/// recording, like run_tse.sh's --output. Only with a registered voice.
+#[derive(Default)]
+struct Saver {
+    file: Option<(PathBuf, record::Wav)>,
+}
+
+impl Saver {
+    /// Adds `audio` for the recording `recording` (None: no call being
+    /// recorded), starting or finishing files as recordings come and go.
+    fn save(&mut self, registered: bool, recording: Option<PathBuf>, audio: &[i16]) {
+        let want = recording
+            .filter(|_| registered)
+            .map(|r| record::cleaned_path(&r));
+        if self.file.as_ref().map(|(p, _)| p) != want.as_ref() {
+            if let Some((_, mut wav)) = self.file.take() {
+                let _ = wav.patch();
+            }
+            self.file = want.and_then(|p| record::Wav::create(&p).ok().map(|w| (p, w)));
+        }
+        if let Some((_, wav)) = &mut self.file
+            && wav.write(audio).is_err()
+        {
+            self.file = None;
         }
     }
 }
@@ -616,6 +650,23 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn saver_follows_the_recording() {
+        let dir = std::env::temp_dir().join(format!("clearvoice-saver-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.wav"), dir.join("b.wav"));
+        let mut s = Saver::default();
+        s.save(true, Some(a.clone()), &[1, 2, 3]);
+        s.save(true, Some(a.clone()), &[4]);
+        s.save(false, Some(b.clone()), &[5]); // not registered: nothing
+        s.save(true, Some(b.clone()), &[6, 7]);
+        s.save(true, None, &[8]); // the recording stopped
+        let len = |p: &Path| (fs::read(p).unwrap().len() - 44) / 2;
+        assert_eq!(len(&record::cleaned_path(&a)), 4);
+        assert_eq!(len(&record::cleaned_path(&b)), 2);
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn local_options_have_defaults_and_limits() {
