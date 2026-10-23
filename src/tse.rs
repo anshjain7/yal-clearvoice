@@ -413,15 +413,19 @@ mod tests {
         );
     }
 
-    /// The model on the Odia sample, against the same model run from Python
-    /// (WeSep's PyTorch code, whole file, remix 0.2). Needs the model files
-    /// beside the engine's folder layout in YAL_TSE_DIR and the two samples.
+    /// The model on a recording, against the same model run from Python
+    /// (WeSep's PyTorch code, whole file, remix 0.2). Set YAL_TSE_TEST to
+    /// "<dir with onnxruntime.dll and wesep\\>|<voice sample.wav>|<noisy
+    /// recording.wav>|<Python's output for them.wav>" (16 kHz mono WAV).
     /// cargo test --release extracts_like_wesep -- --ignored --nocapture
     #[test]
-    #[ignore = "needs the WeSep ONNX files"]
+    #[ignore = "needs the WeSep ONNX files and test recordings"]
     fn extracts_like_wesep() {
-        let dir = std::env::var("YAL_TSE_DIR").expect("set YAL_TSE_DIR");
-        let files = Files::find(Path::new(&dir)).expect("model files");
+        let spec = std::env::var("YAL_TSE_TEST").expect("set YAL_TSE_TEST");
+        let [dir, sample, noisy, python] = spec.split('|').collect::<Vec<_>>()[..] else {
+            panic!("YAL_TSE_TEST needs 4 parts");
+        };
+        let files = Files::find(Path::new(dir)).expect("model files");
         let read = |p: &str| -> Vec<f32> {
             let b = std::fs::read(p).unwrap();
             b[44..]
@@ -431,9 +435,9 @@ mod tests {
                 .map(|&c| i16::from_le_bytes(c) as f32 / 32768.0)
                 .collect()
         };
-        let enroll = read(r"C:\Users\HP\Desktop\00005148.wav");
-        let mix = read(r"C:\Users\HP\Desktop\00005147.wav");
-        let reference = read(r"C:\Users\HP\Desktop\WeSep test\00005147_tse_remix0.2.wav");
+        let enroll = read(sample);
+        let mix = read(noisy);
+        let reference = read(python);
         let t = std::time::Instant::now();
         let mut ex = Extractor::load(&files, 2).unwrap();
         println!("loaded in {:.2} s", t.elapsed().as_secs_f32());
