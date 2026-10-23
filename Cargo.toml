@@ -24,4 +24,4 @@ tungstenite = { version = "0.30", default-features = false, features = ["handsha
 tract-core = "=0.21.4"
 # ponytail: 0.59, plus windows-result/windows-strings 0.3.0 held in Cargo.lock, are the last
 # versions that link on the GNU toolchain without dlltool. Bump freely once builds use MSVC.
-windows ={ version = "0.59", features = ["Win32_Devices_FunctionDiscovery", "Win32_Media_Audio", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com_StructuredStorage", "Win32_System_IO", "Win32_System_Performance", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_Variant", "Win32_UI_Shell_PropertiesSystem"] }
+windows ={ version = "0.59", features = ["Win32_Devices_FunctionDiscovery", "Win32_Media_Audio", "Win32_Media_MediaFoundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com_StructuredStorage", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_Performance", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_Variant", "Win32_UI_Shell_PropertiesSystem"] }

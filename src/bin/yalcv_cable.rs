@@ -335,8 +335,19 @@ fn main() {
                     }
                     // The cleaned voice, as the transcript hears it.
                     UiCommand::RecordVoice => {
-                        if TELEMETRY.voice.load(Relaxed) != ipc::VOICE_RECORDING {
+                        if !matches!(
+                            TELEMETRY.voice.load(Relaxed),
+                            ipc::VOICE_RECORDING | ipc::VOICE_IMPORTING
+                        ) {
                             s.spawn(|| voice::record_sample(cable_input(), &voice::sample_path()));
+                        }
+                    }
+                    UiCommand::ImportVoice(file) => {
+                        if !matches!(
+                            TELEMETRY.voice.load(Relaxed),
+                            ipc::VOICE_RECORDING | ipc::VOICE_IMPORTING
+                        ) {
+                            s.spawn(move || voice::import_sample(&file, &voice::sample_path()));
                         }
                     }
                 }

@@ -137,6 +137,7 @@ sealed class MainForm : Form
     // The agent's voice sample, for keeping other voices out of the transcript
     // (shown only when the engine has a voice server in settings.ini).
     readonly Button _voiceRec = new() { Text = "Register my voice", Visible = false };
+    readonly Button _voiceFile = new() { Text = "Upload voice...", Visible = false };
     readonly Label _voiceStatus = new() { AutoSize = true, ForeColor = Muted, Visible = false };
     volatile bool _recordWanted;   // "Record call audio" ticked (and agreed to)
     int _recordingCall;            // worker thread: the call being recorded, 0 = none
@@ -243,6 +244,21 @@ sealed class MainForm : Form
             _voiceStatus.Text = "● Speak now, for 20 seconds";
             _voiceStatus.ForeColor = Teal;
         };
+        _voiceFile.Click += (_, _) =>
+        {
+            if (MessageBox.Show(this, UploadPrompt, "Upload my voice",
+                    MessageBoxButtons.OKCancel, MessageBoxIcon.Information) != DialogResult.OK) return;
+            using var pick = new OpenFileDialog
+            {
+                Title = "Choose a recording of your voice",
+                InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
+                Filter = "Audio files|*.wav;*.mp3;*.m4a;*.aac;*.wma;*.flac|All files|*.*",
+            };
+            if (pick.ShowDialog(this) != DialogResult.OK) return;
+            _commands.Enqueue("voice import " + pick.FileName);
+            _voiceStatus.Text = "Reading the file...";
+            _voiceStatus.ForeColor = Teal;
+        };
 
         StartEngine();
         // Start talking to the engine once the window exists (UI updates need it).
@@ -266,6 +282,15 @@ sealed class MainForm : Form
         + "people near you aren't talking.\n\n"
         + "Your voice sample is kept on this PC, for your Windows account only, and used "
         + "only to recognise your voice in transcripts. You can register again at any time.";
+
+    const string UploadPrompt =
+        "Instead of recording now, you can use a recording of your voice that you already "
+        + "have, for example a WAV or MP3 file on your Desktop.\n\n"
+        + "Pick one where only you are talking, with nobody else's voice in it. It needs at "
+        + "least 6 seconds of you talking; YAL ClearVoice keeps 20 seconds of it, from where "
+        + "you start talking.\n\n"
+        + "A copy is kept on this PC, for your Windows account only, in place of any voice "
+        + "you registered before. The file you pick isn't changed.";
 
     const string RecordConsent =
         "YAL ClearVoice will record each call you transcribe while \"Record call audio\" "
@@ -415,7 +440,11 @@ sealed class MainForm : Form
         _voiceRec.Location = new Point(142, y);
         _voiceRec.Size = new Size(128, 26);
         Controls.Add(_voiceRec);
-        _voiceStatus.Location = new Point(278, y + 5);
+        _voiceFile.Location = new Point(276, y);
+        _voiceFile.Size = new Size(110, 26);
+        Controls.Add(_voiceFile);
+        y += 32;
+        _voiceStatus.Location = new Point(142, y + 5);
         Controls.Add(_voiceStatus);
 
         // Right column: the call. Nirmala UI (part of Windows) has Latin and the
@@ -612,6 +641,9 @@ sealed class MainForm : Form
             "too_quiet" => ("Didn't hear you: try again", Ink),
             "failed" => ("Couldn't record: try again", Ink),
             "unavailable" => ("Voice filter couldn't start", Ink),
+            "importing" => ("Reading the file...", Teal),
+            "bad_file" => ("Couldn't read that file: try another", Ink),
+            "short_file" => ("Under 6 s of talking in that file: try another", Ink),
             _ => ("", Muted),
         };
         // The AI that removes background noise from the agent's voice. Whenever it
@@ -671,8 +703,8 @@ sealed class MainForm : Form
                 _spkLocked = true;
             }
             ShowHint(hint, notice != 0);
-            _voiceRec.Visible = _voiceStatus.Visible = voice != "off";
-            _voiceRec.Enabled = voice != "recording";
+            _voiceRec.Visible = _voiceFile.Visible = _voiceStatus.Visible = voice != "off";
+            _voiceRec.Enabled = _voiceFile.Enabled = voice != "recording" && voice != "importing";
             _voiceStatus.Text = voiceText;
             _voiceStatus.ForeColor = voiceColor;
             _loading = false;

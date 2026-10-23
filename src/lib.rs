@@ -1,3 +1,4 @@
+pub mod audiofile;
 pub mod capture;
 pub mod denoise;
 pub mod devices;

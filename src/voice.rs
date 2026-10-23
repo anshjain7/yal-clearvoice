@@ -30,6 +30,7 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::audiofile;
 use crate::devices::Direction;
 use crate::ipc::{self, TELEMETRY};
 use crate::record;
@@ -185,6 +186,32 @@ pub fn record_sample(device: Option<String>, path: &Path) {
         Err(e) if e == "too little speech" => ipc::VOICE_TOO_QUIET,
         Err(_) => ipc::VOICE_FAILED,
     });
+}
+
+/// Makes the voice sample from an audio file the agent picked instead of
+/// recording one: `SAMPLE_SECONDS` of it from the first speech. Kept only if
+/// that holds enough speech; otherwise any earlier sample stays.
+pub fn import_sample(file: &Path, path: &Path) {
+    set_state(ipc::VOICE_IMPORTING);
+    let result = (|| {
+        let audio = audiofile::read(file).map_err(|_| ipc::VOICE_BAD_FILE)?;
+        let start = audio.chunks(CHUNK).position(transcribe::is_speech);
+        let start = start.ok_or(ipc::VOICE_SHORT_FILE)? * CHUNK;
+        let sample = &audio[start..audio.len().min(start + SAMPLE_SECONDS * RATE as usize)];
+        if sample
+            .chunks(CHUNK)
+            .filter(|c| transcribe::is_speech(c))
+            .count()
+            < SAMPLE_MIN_SPEECH
+        {
+            return Err(ipc::VOICE_SHORT_FILE);
+        }
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).map_err(|_| ipc::VOICE_FAILED)?;
+        }
+        record::write_wav(path, sample).map_err(|_| ipc::VOICE_FAILED)
+    })();
+    set_state(result.map_or_else(|e| e, |()| ipc::VOICE_READY));
 }
 
 /// Sits between the agent side's listener and its Sarvam relay: while a call
@@ -650,6 +677,29 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn upload_keeps_20_s_from_the_first_speech() {
+        let dir = std::env::temp_dir().join(format!("clearvoice-upload-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (file, sample) = (dir.join("mine.wav"), dir.join("Voice sample.wav"));
+        // 3 s of silence, then 30 s of "speech" (a loud tone).
+        let mut audio = vec![0i16; 3 * RATE as usize];
+        audio.extend((0..30 * RATE as usize).map(|i| ((i as f32 * 0.2).sin() * 8000.0) as i16));
+        record::write_wav(&file, &audio).unwrap();
+        import_sample(&file, &sample);
+        assert_eq!(TELEMETRY.voice.load(Relaxed), ipc::VOICE_READY);
+        let kept = (fs::read(&sample).unwrap().len() - 44) / 2;
+        assert_eq!(kept, SAMPLE_SECONDS * RATE as usize);
+        // Too little speech: the sample made above stays.
+        record::write_wav(&file, &audio[..6 * RATE as usize]).unwrap();
+        import_sample(&file, &sample);
+        assert_eq!(TELEMETRY.voice.load(Relaxed), ipc::VOICE_SHORT_FILE);
+        import_sample(&dir.join("not there.mp3"), &sample);
+        assert_eq!(TELEMETRY.voice.load(Relaxed), ipc::VOICE_BAD_FILE);
+        assert_eq!((fs::read(&sample).unwrap().len() - 44) / 2, kept);
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn saver_follows_the_recording() {

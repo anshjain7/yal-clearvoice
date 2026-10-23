@@ -46,7 +46,8 @@ pub const NOTICE_CABLE_IS_SPEAKER: u8 = 3;
 /// no `[voice]` server set up; no sample yet; recording one; ready (the
 /// server answered, or hasn't been needed yet); the server didn't answer
 /// (the transcript uses the original audio meanwhile); the last recording
-/// held too little speech to keep; recording failed.
+/// held too little speech to keep; recording failed. Then for an uploaded
+/// sample: reading the file; it couldn't be read; too little speech in it.
 pub const VOICE_OFF: u64 = 0;
 pub const VOICE_NO_SAMPLE: u64 = 1;
 pub const VOICE_RECORDING: u64 = 2;
@@ -56,6 +57,9 @@ pub const VOICE_TOO_QUIET: u64 = 5;
 pub const VOICE_FAILED: u64 = 6;
 /// Extraction on this PC couldn't start (its files or ONNX Runtime failed).
 pub const VOICE_UNAVAILABLE: u64 = 7;
+pub const VOICE_IMPORTING: u64 = 8;
+pub const VOICE_BAD_FILE: u64 = 9;
+pub const VOICE_SHORT_FILE: u64 = 10;
 
 /// Live engine telemetry, updated by the audio threads (cheap Relaxed stores) and
 /// read by the IPC thread. A process-wide singleton: there is one engine.
@@ -171,6 +175,8 @@ pub enum UiCommand {
     Record(record::Cmd),
     /// Record the agent's voice sample (see voice.rs).
     RecordVoice,
+    /// Make the voice sample from an audio file instead.
+    ImportVoice(std::path::PathBuf),
 }
 
 /// Total CPU time this process has used across all threads.
@@ -338,6 +344,14 @@ fn handle(cmd: &str, commands: &Sender<UiCommand>) -> String {
             send(UiCommand::RecordVoice);
             telemetry_json()
         }
+        // "voice import <file>": an uploaded voice sample.
+        ("voice", args) if args.starts_with("import ") => {
+            let file = args["import ".len()..].trim();
+            if !file.is_empty() {
+                send(UiCommand::ImportVoice(file.into()));
+            }
+            telemetry_json()
+        }
         // "rec start <file.wav>", "rec stop": call recordings.
         ("rec", args) => {
             match args.split_once(' ').unwrap_or((args, "")) {
@@ -391,6 +405,9 @@ fn voice_name(state: u64) -> &'static str {
         VOICE_TOO_QUIET => "too_quiet",
         VOICE_FAILED => "failed",
         VOICE_UNAVAILABLE => "unavailable",
+        VOICE_IMPORTING => "importing",
+        VOICE_BAD_FILE => "bad_file",
+        VOICE_SHORT_FILE => "short_file",
         _ => "off",
     }
 }
@@ -452,6 +469,10 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(UiCommand::Nc(false))));
         handle("voice record", &tx);
         assert!(matches!(rx.try_recv(), Ok(UiCommand::RecordVoice)));
+        handle(r"voice import C:/Users/a b/Desktop/my voice.m4a", &tx);
+        assert!(
+            matches!(rx.try_recv(), Ok(UiCommand::ImportVoice(p)) if p == std::path::Path::new(r"C:/Users/a b/Desktop/my voice.m4a"))
+        );
         handle("mic abc-123", &tx);
         assert!(matches!(rx.try_recv(), Ok(UiCommand::SetMic(Some(id))) if id == "abc-123"));
         handle("mic default", &tx);

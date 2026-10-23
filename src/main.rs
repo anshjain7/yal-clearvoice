@@ -238,7 +238,7 @@ fn main() -> ExitCode {
                         out_default.store(true, Relaxed);
                     }
                     // Call recordings exist in the VB-CABLE build only.
-                    UiCommand::Record(_) | UiCommand::RecordVoice => {}
+                    UiCommand::Record(_) | UiCommand::RecordVoice | UiCommand::ImportVoice(_) => {}
                 }
             }
             ipc::TELEMETRY
