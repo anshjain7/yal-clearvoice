@@ -5,7 +5,7 @@ the background is mostly other agents talking. Noise removal keeps that,
 because it is speech, and Sarvam then writes it down as the agent's words.
 This server runs target speaker extraction (WeSep BSRNN, the same as
 `run_tse.sh`) on the agent's side of each transcribed call. It uses the
-agent's own 10-second voice sample, and only that voice goes on to Sarvam.
+agent's own 20-second voice sample, and only that voice goes on to Sarvam.
 
 - **What it changes:** only the transcript. What the customer hears still
   comes straight from noise removal on the agent's PC. This model needs
@@ -72,7 +72,7 @@ api_key = <the same YAL_VOICE_KEY>
 remix = 0.2
 ```
 
-Then each agent clicks **Record my voice** once and talks for 10 seconds.
+Then each agent clicks **Register my voice** once and talks for 20 seconds.
 
 The audio travels over plain HTTP unless the server is put behind HTTPS
 (`url = https://...`); call audio should stay on the company network.

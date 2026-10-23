@@ -86,7 +86,7 @@ url = http://<server>:8090   ; only to use a voice server instead
 api_key = <key>
 ```
 
-The window shows **Record my voice** (a 10 s voice sample). The agent's side of
+The window shows **Register my voice** (a 20 s voice sample). The agent's side of
 the transcript then goes through WeSep speaker extraction first: on the PC
 (the `wesep\` folder and `onnxruntime.dll` ship with the app), or on a voice
 server when `[voice] url` is set (see `voice-server/README.md`). On the PC it

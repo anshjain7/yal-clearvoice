@@ -240,7 +240,7 @@ sealed class MainForm : Form
             if (MessageBox.Show(this, VoicePrompt, "Register my voice",
                     MessageBoxButtons.OKCancel, MessageBoxIcon.Information) != DialogResult.OK) return;
             _commands.Enqueue("voice record");
-            _voiceStatus.Text = "● Speak now, for 10 seconds";
+            _voiceStatus.Text = "● Speak now, for 20 seconds";
             _voiceStatus.ForeColor = Teal;
         };
 
@@ -260,8 +260,8 @@ sealed class MainForm : Form
 
     const string VoicePrompt =
         "Register your voice so YAL ClearVoice keeps other people's voices out of your "
-        + "transcripts. It needs 10 seconds of you talking.\n\n"
-        + "After you click OK, talk normally for 10 seconds, as on a call. For example, "
+        + "transcripts. It needs 20 seconds of you talking.\n\n"
+        + "After you click OK, talk normally for 20 seconds, as on a call. For example, "
         + "say your name, your team, and read out a phone number. Pick a moment when "
         + "people near you aren't talking.\n\n"
         + "Your voice sample is kept on this PC, for your Windows account only, and used "
@@ -604,7 +604,7 @@ sealed class MainForm : Form
         var (voiceText, voiceColor) = voice switch
         {
             "no_sample" => ("Not registered yet", Ink),
-            "recording" => ("● Speak now, for 10 seconds", Teal),
+            "recording" => ("● Speak now, for 20 seconds", Teal),
             "ready" => ("Voice registered", Muted),
             "server_down" => ("Voice server not reachable", Ink),
             "too_quiet" => ("Didn't hear you: try again", Ink),

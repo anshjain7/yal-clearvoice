@@ -17,7 +17,7 @@
 //! PC can't keep up it lets blocks through uncleaned until it has caught up.
 //! Whenever extraction isn't possible, the original audio is transcribed.
 //!
-//! The voice sample is 10 s of the agent speaking, recorded once from the
+//! The voice sample is 20 s of the agent speaking, recorded once from the
 //! cleaned voice (the same sound extraction later works on) and kept in
 //! `%LOCALAPPDATA%\YAL ClearVoice\Voice sample.wav`.
 
@@ -51,9 +51,9 @@ const MIN_SPEECH: usize = 3;
 /// on uncleaned until it has caught up, so the transcript never lags more.
 const MAX_BEHIND: Duration = Duration::from_secs(4);
 /// How long the voice sample is.
-pub const SAMPLE_SECONDS: usize = 10;
-/// Speech the sample must hold to be any use: 3 s.
-const SAMPLE_MIN_SPEECH: usize = 30;
+pub const SAMPLE_SECONDS: usize = 20;
+/// Speech the sample must hold to be any use: 6 s.
+const SAMPLE_MIN_SPEECH: usize = 60;
 /// After the server fails, the original audio is transcribed for this long
 /// before trying it again.
 const OFF_AFTER_FAILURE: Duration = Duration::from_secs(30);
