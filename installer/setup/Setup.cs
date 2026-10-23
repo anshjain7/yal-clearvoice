@@ -233,6 +233,9 @@ static class Installer
             foreach (var e in zip.Entries.Where(e => e.Name.Length > 0))
                 TryDelete(Path.Combine(dir, e.FullName));
         if (uninstaller is not null) TryDelete(uninstaller);
+        // The app's own subfolders (wesep\), once empty.
+        try { var sub = Path.Combine(dir, "wesep"); if (Directory.Exists(sub) && !Directory.EnumerateFileSystemEntries(sub).Any()) Directory.Delete(sub); }
+        catch (IOException) { }
         try { if (!Directory.EnumerateFileSystemEntries(dir).Any()) Directory.Delete(dir); }
         catch (IOException) { }
     }

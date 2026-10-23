@@ -17,7 +17,8 @@ computer, but building and running it needs a Windows PC.
 | `ui/` | The YAL ClearVoice window (C#, WinForms, .NET Framework 4.8). See `ui/README.md`. |
 | `installer/setup/` | The one-file setup, `YAL ClearVoice Setup.exe`. |
 | `models/` | The DeepFilterNet3 model the engine loads. |
-| `voice-server/` | Optional server (Python, WeSep) that keeps other people's voices out of the agents' transcripts. |
+| `src/tse.rs`, `models/wesep/` | WeSep speaker extraction on the agent's PC (ONNX, 8-bit separator): keeps other people's voices out of the transcript. `third_party/onnxruntime/` holds Microsoft's ONNX Runtime (MIT). |
+| `voice-server/` | The same on a GPU server instead, when settings.ini has a `[voice]` url. |
 | `docs/user-guide/` | The user guide for agents (HTML source and pictures). |
 | `docs/client-brief/` | The page explaining the app to the client. |
 | `driver/`, `installer/Package.wxs` | Our own virtual microphone driver and MSI. Not used yet: today the app uses VB-CABLE. |

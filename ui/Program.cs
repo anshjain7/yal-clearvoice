@@ -264,8 +264,8 @@ sealed class MainForm : Form
         + "After you click OK, talk normally for 10 seconds, as on a call. For example, "
         + "say your name, your team, and read out a phone number. Pick a moment when "
         + "people near you aren't talking.\n\n"
-        + "Your voice sample is kept on this PC and sent to your company's voice server, "
-        + "which uses it to recognise your voice.";
+        + "Your voice sample is kept on this PC and used only to recognise your voice in "
+        + "transcripts.";
 
     const string RecordConsent =
         "YAL ClearVoice will record each call you transcribe while \"Record call audio\" "
@@ -609,6 +609,7 @@ sealed class MainForm : Form
             "server_down" => ("Voice server not reachable", Ink),
             "too_quiet" => ("Didn't hear you: try again", Ink),
             "failed" => ("Couldn't record: try again", Ink),
+            "unavailable" => ("Voice filter couldn't start", Ink),
             _ => ("", Muted),
         };
         // The AI that removes background noise from the agent's voice. Whenever it

@@ -79,15 +79,20 @@ api_key = <key>
 [noise]                ; optional: how much noise removal takes out at most
 attenuation_db = 24    ; 6..100 dB; 100 = all it can (sounds muffled with a
                        ; noise-cancelling headset like the Detecta 201)
-[voice]                ; optional: keep other voices out of the transcript
-url = http://<server>:8090
+[voice]                ; optional
+remix = 0.2            ; how much of the original is mixed back in
+threads = 2            ; for WeSep on this PC (1-8)
+url = http://<server>:8090   ; only to use a voice server instead
 api_key = <key>
-remix = 0.2
 ```
 
-With `[voice]`, the window shows **Record my voice** (a 10 s voice sample)
-and the agent's side of the transcript goes through the voice server first;
-see `voice-server/README.md`.
+The window shows **Record my voice** (a 10 s voice sample). The agent's side of
+the transcript then goes through WeSep speaker extraction first: on the PC
+(the `wesep\` folder and `onnxruntime.dll` ship with the app), or on a voice
+server when `[voice] url` is set (see `voice-server/README.md`). On the PC it
+runs below normal priority, cleans only stretches with speech, and lets audio
+through uncleaned whenever it falls more than 4 s behind, so call audio is
+never affected.
 
 ## Protocol (the pipe contract)
 

@@ -54,6 +54,8 @@ pub const VOICE_READY: u64 = 3;
 pub const VOICE_SERVER_DOWN: u64 = 4;
 pub const VOICE_TOO_QUIET: u64 = 5;
 pub const VOICE_FAILED: u64 = 6;
+/// Extraction on this PC couldn't start (its files or ONNX Runtime failed).
+pub const VOICE_UNAVAILABLE: u64 = 7;
 
 /// Live engine telemetry, updated by the audio threads (cheap Relaxed stores) and
 /// read by the IPC thread. A process-wide singleton: there is one engine.
@@ -388,6 +390,7 @@ fn voice_name(state: u64) -> &'static str {
         VOICE_SERVER_DOWN => "server_down",
         VOICE_TOO_QUIET => "too_quiet",
         VOICE_FAILED => "failed",
+        VOICE_UNAVAILABLE => "unavailable",
         _ => "off",
     }
 }

@@ -52,6 +52,10 @@ $stage = New-Item -ItemType Directory -Force "$work\payload"
 Copy-Item "$root\ui\YalClearVoice.exe" "$stage\YAL ClearVoice.exe"
 Copy-Item "$env:TEMP\cvdist\release\yalcv_cable.exe" "$stage\YAL ClearVoice Engine.exe"
 Copy-Item "$root\models\DeepFilterNet3_onnx.tar.gz" $stage
+# WeSep speaker extraction for the transcript, on the PC (tse.rs), and ONNX Runtime.
+New-Item -ItemType Directory -Force "$stage\wesep" | Out-Null
+Copy-Item "$root\models\wesep\speaker.onnx", "$root\models\wesep\separator.int8.onnx" "$stage\wesep"
+Copy-Item "$root\third_party\onnxruntime\onnxruntime.dll" $stage
 Copy-Item -LiteralPath $Settings "$stage\settings.ini"
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $opt = [IO.Compression.CompressionLevel]::Optimal

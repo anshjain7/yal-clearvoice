@@ -24,6 +24,7 @@ use clearvoice::record;
 use clearvoice::ring;
 use clearvoice::stream::{self, supervise};
 use clearvoice::transcribe::{self, Side};
+use clearvoice::tse;
 use clearvoice::voice;
 
 const RETRY: Duration = Duration::from_millis(500);
@@ -197,8 +198,21 @@ fn main() {
     if transcription.is_some() {
         transcribe::enable();
     }
-    let voice_server = voice::Settings::parse(&ini);
-    voice::set_state(voice::initial_state(voice_server.as_ref()));
+    // Keeping other voices out of the transcript: a [voice] server if there
+    // is one, else WeSep on this PC when its files ship with the engine.
+    let exe_dir = beside_exe("");
+    let voice_backend = match voice::Settings::parse(&ini) {
+        Some(server) => Some(voice::Backend::Server(server)),
+        None => tse::Files::find(&exe_dir).map(|files| {
+            let (remix, threads) = voice::local_options(&ini);
+            voice::Backend::Local {
+                files,
+                remix,
+                threads,
+            }
+        }),
+    };
+    voice::set_state(voice::initial_state(voice_backend.is_some()));
 
     if !headless {
         println!("YAL ClearVoice is running.");
@@ -277,10 +291,10 @@ fn main() {
                 let (tx, rx) = mpsc::channel();
                 s.spawn(move || transcribe::listen(endpoint, tx, listen_stop));
                 // Only the agent's own voice, when there's a voice server.
-                let rx = match (&voice_server, side) {
-                    (Some(server), Side::Agent) => {
+                let rx = match (&voice_backend, side) {
+                    (Some(backend), Side::Agent) => {
                         let (clean_tx, clean_rx) = mpsc::channel();
-                        s.spawn(move || voice::clean(server, rx, clean_tx));
+                        s.spawn(move || voice::clean(backend, rx, clean_tx));
                         clean_rx
                     }
                     _ => rx,

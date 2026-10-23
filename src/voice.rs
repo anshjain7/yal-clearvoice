@@ -1,15 +1,21 @@
 //! The agent's own voice, kept apart from voices nearby, for the transcript.
 //!
 //! In an office the background is mostly other agents talking, which noise
-//! removal keeps (it's speech) and Sarvam then writes down as the agent. With
-//! a `[voice]` server in settings.ini, the agent's side of a transcribed call
-//! goes through target speaker extraction there first (WeSep, run as the
-//! team's run_tse.sh: the agent's voice sample as the enrollment, part of the
-//! original mixed back in): 2 s at a time, with 1 s before it for context, so
-//! the agent's lines reach the transcript about 2 s later. Only the
-//! transcript is affected; the call itself still gets the voice straight from
-//! noise removal. If the server can't be reached the original audio is
-//! transcribed, as without one.
+//! removal keeps (it's speech) and Sarvam then writes down as the agent. So
+//! the agent's side of a transcribed call goes through target speaker
+//! extraction first (WeSep, as the team's run_tse.sh: the agent's voice sample
+//! as the enrollment, part of the original mixed back in): on this PC
+//! (tse.rs) when the WeSep files ship with the engine, or on a `[voice]`
+//! server from settings.ini. It works on 2 s at a time with 0.5 s before it
+//! for context, so the agent's lines reach the transcript a few seconds
+//! later. Only the transcript is affected; the call itself still gets the
+//! voice straight from noise removal.
+//!
+//! On this PC it stays out of the call's way: it runs on its own thread below
+//! normal priority (noise removal and the audio threads run at Pro Audio
+//! priority above it), cleans only blocks with speech in them, and when the
+//! PC can't keep up it lets blocks through uncleaned until it has caught up.
+//! Whenever extraction isn't possible, the original audio is transcribed.
 //!
 //! The voice sample is 10 s of the agent speaking, recorded once from the
 //! cleaned voice (the same sound extraction later works on) and kept in
@@ -28,11 +34,22 @@ use crate::devices::Direction;
 use crate::ipc::{self, TELEMETRY};
 use crate::record;
 use crate::transcribe::{self, CHUNK, RATE, Tap};
+use crate::tse;
 
 /// Audio cleaned per request: 2 s.
 const BLOCK: usize = 2 * RATE as usize;
-/// Audio sent before each block for context, and not returned: 1 s.
-const CONTEXT: usize = RATE as usize;
+/// Audio sent before each block for context, and not returned: 0.5 s
+/// (half the work of a full second, for the same result inside the block).
+const CONTEXT: usize = RATE as usize / 2;
+/// One block, in time.
+const BLOCK_TIME: Duration = Duration::from_secs(2);
+/// Blocks with less speech than this (100 ms chunks) go on uncleaned: after
+/// noise removal the agent's side is nearly silent between words, so they
+/// hold no voices worth removing, and skipping them about halves the work.
+const MIN_SPEECH: usize = 3;
+/// How far behind the call extraction may fall (a slow PC) before blocks go
+/// on uncleaned until it has caught up, so the transcript never lags more.
+const MAX_BEHIND: Duration = Duration::from_secs(4);
 /// How long the voice sample is.
 pub const SAMPLE_SECONDS: usize = 10;
 /// Speech the sample must hold to be any use: 3 s.
@@ -82,6 +99,41 @@ impl Settings {
     }
 }
 
+/// Where the agent's voice is extracted.
+pub enum Backend {
+    /// A `[voice]` server.
+    Server(Settings),
+    /// On this PC, with the WeSep files that ship with the engine.
+    Local {
+        files: tse::Files,
+        remix: f32,
+        /// Threads for the separator.
+        threads: usize,
+    },
+}
+
+/// `[voice]` remix (default 0.2) and threads (default 2, at most 8) for
+/// extraction on this PC.
+pub fn local_options(ini: &str) -> (f32, usize) {
+    let (mut section, mut remix, mut threads) = ("", 0.2f32, 2usize);
+    for line in ini.trim_start_matches('\u{feff}').lines().map(str::trim) {
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            section = name.trim();
+        } else if section == "voice"
+            && !line.starts_with(';')
+            && let Some((k, v)) = line.split_once('=')
+        {
+            let v = v.split(';').next().unwrap_or("").trim();
+            match k.trim() {
+                "remix" => remix = v.parse().unwrap_or(remix).clamp(0.0, 1.0),
+                "threads" => threads = v.parse().unwrap_or(threads).clamp(1, 8),
+                _ => {}
+            }
+        }
+    }
+    (remix, threads)
+}
+
 /// Where the agent's voice sample is kept.
 pub fn sample_path() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA").map_or_else(std::env::temp_dir, PathBuf::from);
@@ -93,12 +145,13 @@ pub fn set_state(state: u64) {
     TELEMETRY.voice.store(state, Relaxed);
 }
 
-/// The state at startup, from whether a sample exists.
-pub fn initial_state(settings: Option<&Settings>) -> u64 {
-    match settings {
-        None => ipc::VOICE_OFF,
-        Some(_) if sample_path().is_file() => ipc::VOICE_READY,
-        Some(_) => ipc::VOICE_NO_SAMPLE,
+/// The state at startup: off without a way to extract, else from whether a
+/// sample exists.
+pub fn initial_state(available: bool) -> u64 {
+    match available {
+        false => ipc::VOICE_OFF,
+        true if sample_path().is_file() => ipc::VOICE_READY,
+        true => ipc::VOICE_NO_SAMPLE,
     }
 }
 
@@ -135,16 +188,26 @@ pub fn record_sample(device: Option<String>, path: &Path) {
 }
 
 /// Sits between the agent side's listener and its Sarvam relay: while a call
-/// is being transcribed and there's a voice sample, sends the audio through
-/// the server in 2 s blocks and passes on what comes back; otherwise, or when
-/// the server fails, passes the audio on as it is. Runs until `input` closes.
-pub fn clean(settings: &Settings, input: Receiver<Vec<i16>>, out: Sender<Vec<i16>>) {
-    let mut client = Client::new(settings.clone(), sample_path());
+/// is being transcribed and there's a voice sample, cleans the audio in 2 s
+/// blocks and passes on the result; otherwise, or when extraction fails,
+/// passes the audio on as it is. Runs until `input` closes.
+pub fn clean(backend: &Backend, input: Receiver<Vec<i16>>, out: Sender<Vec<i16>>) {
+    below_normal_priority();
+    let mut engine = match backend {
+        Backend::Server(settings) => Engine::Server(Client::new(settings.clone(), sample_path())),
+        Backend::Local {
+            files,
+            remix,
+            threads,
+        } => Engine::Local(Box::new(Local::new(files, *remix, *threads, sample_path()))),
+    };
     let mut blocks = Blocks::default();
     let mut off_until: Option<Instant> = None;
+    // How far behind the call extraction has fallen.
+    let mut behind = Duration::ZERO;
     for chunk in input {
         let on = transcribe::active()
-            && client.sample.is_file()
+            && engine.sample().is_file()
             && off_until.is_none_or(|t| Instant::now() >= t);
         if !on {
             // Audio held for a block that won't be cleaned goes on as it is.
@@ -157,16 +220,28 @@ pub fn clean(settings: &Settings, input: Receiver<Vec<i16>>, out: Sender<Vec<i16
         let Some((context, block)) = blocks.push(&chunk) else {
             continue;
         };
-        let cleaned = match client.extract(&context, &block) {
-            Ok(cleaned) => {
-                set_state(ipc::VOICE_READY);
-                off_until = None;
-                cleaned
-            }
-            Err(_) => {
-                set_state(ipc::VOICE_SERVER_DOWN);
-                off_until = Some(Instant::now() + OFF_AFTER_FAILURE);
-                block
+        let speech = block
+            .chunks(CHUNK)
+            .filter(|c| transcribe::is_speech(c))
+            .count();
+        let cleaned = if speech < MIN_SPEECH || behind > MAX_BEHIND {
+            behind = behind.saturating_sub(BLOCK_TIME);
+            block
+        } else {
+            let started = Instant::now();
+            let result = engine.extract(&context, &block);
+            behind = (behind + started.elapsed()).saturating_sub(BLOCK_TIME);
+            match result {
+                Ok(cleaned) => {
+                    set_state(ipc::VOICE_READY);
+                    off_until = None;
+                    cleaned
+                }
+                Err(_) => {
+                    set_state(engine.failed_state());
+                    off_until = Some(Instant::now() + OFF_AFTER_FAILURE);
+                    block
+                }
             }
         };
         for c in cleaned.chunks(CHUNK) {
@@ -211,6 +286,129 @@ impl Blocks {
         self.remember(&block);
         block
     }
+}
+
+/// Whichever extracts: the server or this PC.
+enum Engine {
+    Server(Client),
+    Local(Box<Local>),
+}
+
+impl Engine {
+    fn sample(&self) -> &Path {
+        match self {
+            Engine::Server(c) => &c.sample,
+            Engine::Local(l) => &l.sample,
+        }
+    }
+
+    fn extract(&mut self, context: &[i16], block: &[i16]) -> Result<Vec<i16>, String> {
+        match self {
+            Engine::Server(c) => c.extract(context, block),
+            Engine::Local(l) => l.extract(context, block),
+        }
+    }
+
+    /// What the window shows when extraction fails.
+    fn failed_state(&self) -> u64 {
+        match self {
+            Engine::Server(_) => ipc::VOICE_SERVER_DOWN,
+            Engine::Local(_) => ipc::VOICE_UNAVAILABLE,
+        }
+    }
+}
+
+/// WeSep on this PC (tse.rs). Loaded when cleaning starts, not on the first
+/// call, since loading takes a few seconds.
+struct Local {
+    files: tse::Files,
+    remix: f32,
+    threads: usize,
+    sample: PathBuf,
+    model: Option<tse::Extractor>,
+    /// The voice sample's embedding, and the sample's time when computed.
+    embedding: Option<(Vec<f32>, SystemTime)>,
+}
+
+impl Local {
+    fn new(files: &tse::Files, remix: f32, threads: usize, sample: PathBuf) -> Local {
+        let files = tse::Files {
+            runtime: files.runtime.clone(),
+            speaker: files.speaker.clone(),
+            separator: files.separator.clone(),
+        };
+        let mut local = Local {
+            files,
+            remix,
+            threads,
+            sample,
+            model: None,
+            embedding: None,
+        };
+        if local.load().is_err() {
+            set_state(ipc::VOICE_UNAVAILABLE);
+        }
+        local
+    }
+
+    fn load(&mut self) -> Result<&mut tse::Extractor, String> {
+        if self.model.is_none() {
+            self.model = Some(tse::Extractor::load(&self.files, self.threads)?);
+        }
+        Ok(self.model.as_mut().expect("just loaded"))
+    }
+
+    fn extract(&mut self, context: &[i16], block: &[i16]) -> Result<Vec<i16>, String> {
+        let modified = fs::metadata(&self.sample)
+            .and_then(|m| m.modified())
+            .map_err(|e| e.to_string())?;
+        let stale = !matches!(&self.embedding, Some((_, at)) if *at == modified);
+        let voice = if stale {
+            Some(read_sample(&self.sample)?)
+        } else {
+            None
+        };
+        let model = self.load()?;
+        if let Some(voice) = voice {
+            let embedding = model.enroll(&voice)?;
+            self.embedding = Some((embedding, modified));
+        }
+        let model = self.model.as_mut().expect("loaded above");
+        let embedding = &self.embedding.as_ref().expect("enrolled above").0;
+        let mix: Vec<f32> = context
+            .iter()
+            .chain(block)
+            .map(|&s| f32::from(s) / 32768.0)
+            .collect();
+        let est = model.extract(embedding, &mix)?;
+        let out = tse::remix(&est, &mix, self.remix);
+        Ok(out[context.len()..]
+            .iter()
+            .map(|v| (v.clamp(-1.0, 1.0) * 32767.0) as i16)
+            .collect())
+    }
+}
+
+/// The voice sample as samples in -1..1 (record_sample's own 16 kHz WAV).
+fn read_sample(path: &Path) -> Result<Vec<f32>, String> {
+    let bytes = fs::read(path).map_err(|e| e.to_string())?;
+    let data = bytes.get(44..).ok_or("voice sample is empty")?;
+    Ok(data
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&b| f32::from(i16::from_le_bytes(b)) / 32768.0)
+        .collect())
+}
+
+/// Lowers this thread below normal priority: extraction is never more urgent
+/// than anything else on the PC, least of all the call's audio.
+fn below_normal_priority() {
+    use windows::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+    };
+    // SAFETY: a plain Win32 call on this thread's own pseudo-handle.
+    let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
 }
 
 /// Talks to the extraction server.
@@ -420,6 +618,20 @@ mod tests {
     use std::thread;
 
     #[test]
+    fn local_options_have_defaults_and_limits() {
+        assert_eq!(local_options(""), (0.2, 2));
+        assert_eq!(
+            local_options("[voice]\nremix = 0.3\nthreads = 4 ; faster PC\n"),
+            (0.3, 4)
+        );
+        assert_eq!(
+            local_options("[voice]\nthreads = 64\nremix = 7\n"),
+            (1.0, 8)
+        );
+        assert_eq!(local_options("[noise]\nthreads = 4\n"), (0.2, 2));
+    }
+
+    #[test]
     fn settings_read_only_the_voice_section() {
         let ini = "[summary]\nurl = http://a/v1\n[voice]\nurl = http://10.0.0.5:8090/ ; tse\n\
                    api_key = k1\nremix = 0.3\n";
@@ -473,14 +685,14 @@ mod tests {
         }
         let (context, block) = b.push(&chunk(19)).unwrap();
         assert_eq!((context.len(), block.len()), (0, BLOCK));
-        // The next block's context is the last second of the first.
+        // The next block's context is the last half second of the first.
         for i in 20..39 {
             assert!(b.push(&chunk(i)).is_none());
         }
         let (context, block) = b.push(&chunk(39)).unwrap();
         assert_eq!(
             (context.len(), context[0], *context.last().unwrap()),
-            (CONTEXT, 10, 19)
+            (CONTEXT, 15, 19)
         );
         assert_eq!((block[0], *block.last().unwrap()), (20, 39));
         // Audio that went on uncleaned still counts as context.
@@ -567,6 +779,83 @@ mod tests {
         assert!(text(&got[4]).starts_with("POST /enroll"));
         assert!(text(&got[5]).contains("id=def456"));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// WeSep on this PC through `clean()`, as during a transcribed call: a
+    /// recording (repeated to 30 s, real-time paced, so the lag limit and the
+    /// speech-only rule are at work) goes in as 100 ms chunks, and what comes
+    /// out is checked and written. The voice sample must already be at
+    /// `sample_path()`. Set YAL_TSE_TEST to "<dir with onnxruntime.dll and
+    /// wesep\\>|<noisy recording.wav>|<output.wav>".
+    /// cargo test --release cleans_on_this_pc -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs the WeSep files and a voice sample"]
+    fn cleans_on_this_pc() {
+        let spec = std::env::var("YAL_TSE_TEST").expect("set YAL_TSE_TEST");
+        let [dir, input, output] = spec.split('|').collect::<Vec<_>>()[..] else {
+            panic!("YAL_TSE_TEST needs 3 parts");
+        };
+        assert!(
+            sample_path().is_file(),
+            "no voice sample at {}",
+            sample_path().display()
+        );
+        let b = fs::read(input).unwrap();
+        let one: Vec<i16> = b[44..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| i16::from_le_bytes(c))
+            .collect();
+        let audio: Vec<i16> = one
+            .iter()
+            .copied()
+            .cycle()
+            .take(30 * RATE as usize)
+            .collect();
+        let files = tse::Files::find(Path::new(dir)).expect("WeSep files");
+        let backend = Backend::Local {
+            files,
+            remix: 0.2,
+            threads: 2,
+        };
+        transcribe::enable();
+        transcribe::start_call();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        let t0 = Instant::now();
+        let cleaner = std::thread::spawn(move || clean(&backend, rx, out_tx));
+        std::thread::sleep(Duration::from_secs(8)); // the model loads first
+        let started = Instant::now();
+        for (i, c) in audio.chunks(CHUNK).enumerate() {
+            let due = started + Duration::from_millis(100 * i as u64);
+            std::thread::sleep(due.saturating_duration_since(Instant::now()));
+            tx.send(c.to_vec()).unwrap();
+        }
+        // Whatever is still waiting when the call ends goes on as it is.
+        std::thread::sleep(Duration::from_secs(3));
+        transcribe::end_call();
+        tx.send(vec![0; CHUNK]).unwrap();
+        drop(tx);
+        cleaner.join().unwrap();
+        let got: Vec<i16> = out_rx.iter().flatten().collect();
+        println!(
+            "{:.1} s in, {:.1} s out, voice state {}, finished {:.1} s after the last chunk",
+            audio.len() as f32 / RATE as f32,
+            got.len() as f32 / RATE as f32,
+            TELEMETRY.voice.load(Relaxed),
+            started.elapsed().as_secs_f32() - 30.0 - 3.0
+        );
+        let _ = t0;
+        assert!(got.len() >= audio.len(), "audio went missing");
+        let changed = got
+            .chunks(BLOCK)
+            .zip(audio.chunks(BLOCK))
+            .filter(|(a, b)| a != b)
+            .count();
+        println!("{changed} of {} blocks cleaned", audio.len() / BLOCK);
+        assert!(changed > 0, "nothing was cleaned");
+        record::write_wav(Path::new(output), &got[..audio.len()]).unwrap();
     }
 
     /// Against a real voice server (voice-server/voice_server.py): sends a

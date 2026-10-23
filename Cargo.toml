@@ -12,6 +12,11 @@ ndarray = "0.15" # libDF's array types
 # Live transcription: Sarvam's real-time speech-to-text WebSocket (TLS through
 # Windows' own schannel) and its JSON messages.
 serde_json = "1"
+# ONNX Runtime for WeSep speaker extraction on the PC (tse.rs). The DLL ships
+# next to the engine and is loaded at run time: no download at build time.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic"] }
+# FFTs for WeSep's STFT and fbank (tse.rs); already used by DeepFilterNet.
+realfft = "3.5"
 # The voice server (voice.rs) over https, through the same Windows schannel.
 native-tls = "0.2"
 tungstenite = { version = "0.30", default-features = false, features = ["handshake", "native-tls"] }
