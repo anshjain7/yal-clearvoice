@@ -136,7 +136,7 @@ sealed class MainForm : Form
     readonly Button _recOpen = new() { Text = "Open recordings" };
     // The agent's voice sample, for keeping other voices out of the transcript
     // (shown only when the engine has a voice server in settings.ini).
-    readonly Button _voiceRec = new() { Text = "Record my voice", Visible = false };
+    readonly Button _voiceRec = new() { Text = "Register my voice", Visible = false };
     readonly Label _voiceStatus = new() { AutoSize = true, ForeColor = Muted, Visible = false };
     volatile bool _recordWanted;   // "Record call audio" ticked (and agreed to)
     int _recordingCall;            // worker thread: the call being recorded, 0 = none
@@ -237,7 +237,7 @@ sealed class MainForm : Form
         _recOpen.Click += (_, _) => OpenFolder(Recordings);
         _voiceRec.Click += (_, _) =>
         {
-            if (MessageBox.Show(this, VoicePrompt, "Record my voice",
+            if (MessageBox.Show(this, VoicePrompt, "Register my voice",
                     MessageBoxButtons.OKCancel, MessageBoxIcon.Information) != DialogResult.OK) return;
             _commands.Enqueue("voice record");
             _voiceStatus.Text = "● Speak now, for 10 seconds";
@@ -259,13 +259,13 @@ sealed class MainForm : Form
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "YAL ClearVoice", "Recordings");
 
     const string VoicePrompt =
-        "To keep other people's voices out of your transcripts, YAL ClearVoice needs "
-        + "10 seconds of your voice.\n\n"
+        "Register your voice so YAL ClearVoice keeps other people's voices out of your "
+        + "transcripts. It needs 10 seconds of you talking.\n\n"
         + "After you click OK, talk normally for 10 seconds, as on a call. For example, "
         + "say your name, your team, and read out a phone number. Pick a moment when "
         + "people near you aren't talking.\n\n"
-        + "Your voice sample is kept on this PC and used only to recognise your voice in "
-        + "transcripts.";
+        + "Your voice sample is kept on this PC, for your Windows account only, and used "
+        + "only to recognise your voice in transcripts. You can register again at any time.";
 
     const string RecordConsent =
         "YAL ClearVoice will record each call you transcribe while \"Record call audio\" "
@@ -603,9 +603,9 @@ sealed class MainForm : Form
         string voice = r.TryGetValue("voice", out var vo) ? vo as string ?? "off" : "off";
         var (voiceText, voiceColor) = voice switch
         {
-            "no_sample" => ("No voice sample yet", Muted),
+            "no_sample" => ("Not registered yet", Ink),
             "recording" => ("● Speak now, for 10 seconds", Teal),
-            "ready" => ("Voice sample saved", Muted),
+            "ready" => ("Voice registered", Muted),
             "server_down" => ("Voice server not reachable", Ink),
             "too_quiet" => ("Didn't hear you: try again", Ink),
             "failed" => ("Couldn't record: try again", Ink),
