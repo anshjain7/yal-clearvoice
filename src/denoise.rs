@@ -51,7 +51,7 @@ const MAX_DELAY_FRAMES: u64 = 7;
 /// Detecta 201 already cut background noise at their noise-cancelling
 /// microphone, so a limit leaves the voice natural and the remaining noise
 /// far down. Below the limit, libDF mixes that much of the original back in.
-pub const DEFAULT_ATTENUATION_DB: f32 = 24.0;
+pub const DEFAULT_ATTENUATION_DB: f32 = 15.0;
 /// The range settings.ini may set: 6 dB (barely any) to 100 (no limit).
 const ATTENUATION_RANGE: std::ops::RangeInclusive<f32> = 6.0..=100.0;
 /// Model failures in a row before the stage drops the model and bypasses.
@@ -530,15 +530,16 @@ mod tests {
             let tail = noise.len() - 48_000..noise.len();
             20.0 * (rms(&out[tail.clone()]) / rms(&noise[tail])).log10()
         };
-        let (full, limited) = (reduction(100.0), reduction(24.0));
-        println!("noise reduction: {full:.1} dB without a limit, {limited:.1} dB with 24 dB");
+        let limit = DEFAULT_ATTENUATION_DB;
+        let (full, limited) = (reduction(100.0), reduction(limit));
+        println!("noise reduction: {full:.1} dB without a limit, {limited:.1} dB with {limit} dB");
         assert!(
             full < -30.0,
             "without a limit it removes far more: {full:.1} dB"
         );
         assert!(
-            (-26.0..=-20.0).contains(&limited),
-            "24 dB limit gave {limited:.1} dB"
+            (-limit - 2.0..=-limit + 4.0).contains(&limited),
+            "{limit} dB limit gave {limited:.1} dB"
         );
     }
 

@@ -77,7 +77,7 @@ url = http://<server>/v1/chat/completions
 model = <model name>
 api_key = <key>
 [noise]                ; optional: how much noise removal takes out at most
-attenuation_db = 24    ; 6..100 dB; 100 = all it can (sounds muffled with a
+attenuation_db = 15    ; 6..100 dB; 100 = all it can (sounds muffled with a
                        ; noise-cancelling headset like the Detecta 201)
 [voice]                ; optional
 remix = 0.2            ; how much of the original is mixed back in
