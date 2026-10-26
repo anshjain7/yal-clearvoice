@@ -295,9 +295,9 @@ sealed class MainForm : Form
     const string RecordConsent =
         "YAL ClearVoice will record each call you transcribe while \"Record call audio\" "
         + "is ticked, from Start to Stop, as one audio file with both you and the customer. "
-        + "Your own side is also saved twice in the \"Agent voice\" folder: as your "
-        + "microphone heard it (noisy), and cleaned, with other people's voices and noise "
-        + "removed.\n\n"
+        + "Your own side is also saved in the \"Agent voice\" folder at each step: as your "
+        + "microphone heard it (input), with other people's voices removed (audio_tse), and "
+        + "with noise removed too (audio_tse_se).\n\n"
         + "Only record calls where the customer has been told the call may be recorded.\n\n"
         + "Recordings stay on this PC (\"Open recordings\" shows them). Nothing is "
         + "uploaded or sent anywhere.\n\n"
