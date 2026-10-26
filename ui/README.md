@@ -80,7 +80,8 @@ api_key = <key>
 attenuation_db = 15    ; 6..100 dB; 100 = all it can (sounds muffled with a
                        ; noise-cancelling headset like the Detecta 201)
 [voice]                ; optional
-remix = 0.2            ; how much of the original is mixed back in
+remix = 0              ; how much of the original is mixed back in (0 = none;
+                       ; with a voice server the default is 0.2)
 threads = 2            ; for WeSep on this PC (1-8)
 mute_others = on       ; voice-match mute on this PC; off to turn it off
 url = http://<server>:8090   ; only to use a voice server instead
@@ -88,18 +89,25 @@ api_key = <key>
 ```
 
 The window shows **Register my voice** (a 20 s voice sample). The agent's side of
-the transcript then goes through WeSep speaker extraction first: on the PC
-(the `wesep\` folder and `onnxruntime.dll` ship with the app), or on a voice
-server when `[voice] url` is set (see `voice-server/README.md`). On the PC it
-runs below normal priority, cleans only stretches with speech, and lets audio
-through uncleaned whenever it falls more than 4 s behind, so call audio is
-never affected. After WeSep, a voice-match mute checks each stretch against
-the voice sample, a second at a time, and turns down by 30 dB whatever doesn't
-sound like the agent, such as a colleague talking while the agent is silent
-(WeSep alone lets that through). The mute is about 25 times lighter than
-WeSep: when WeSep can't clean a stretch in less time than it lasts (most
-15 W office laptops), the app leaves WeSep out for a minute and runs the mute
-alone, which still keeps out colleagues talking in turn with the agent.
+the transcript then goes through WeSep speaker extraction: on the PC (the
+`wesep\` folder and `onnxruntime.dll` ship with the app), or on a voice server
+when `[voice] url` is set (see `voice-server/README.md`).
+
+On the PC it follows the team's configuration (`run_tse.sh --chunk_sec 3.0
+--overlap_sec 1.0`, then `run_se.sh`): WeSep works on the agent's raw
+microphone, before noise removal, in 3 s chunks overlapping by 1 s
+(crossfaded), with no remix; then DeepFilterNet3 speech enhancement (at the
+`[noise]` limit) cleans the result. That's what the transcript and each
+recording's `cleaned voice.wav` get. It runs below normal priority, cleans
+only stretches with speech, and lets audio through without extraction
+whenever it falls more than 4 s behind, so call audio is never affected.
+
+When WeSep can't clean a chunk in less time than it lasts (most 15 W office
+laptops, or a PC on battery), the app leaves it out for a minute and runs a
+voice-match mute in its place, also before speech enhancement: each stretch
+is checked against the voice sample a second at a time, and whatever doesn't
+sound like the agent is turned down by 30 dB. It's about a tenth of WeSep's
+work and keeps out colleagues talking in turn with the agent.
 
 ## Protocol (the pipe contract)
 

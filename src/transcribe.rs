@@ -251,13 +251,19 @@ fn set_error(message: &str) {
     }
 }
 
-/// Records one side from the output device `endpoint` names (followed as it
-/// changes) until `stop`, updating the call and handing chunks to `out`.
-pub fn listen(endpoint: fn() -> Option<String>, out: Sender<Vec<i16>>, stop: &AtomicBool) {
+/// Records one side from the device `endpoint` names (followed as it
+/// changes): an output device by loopback, or an input device. Runs until
+/// `stop`, updating the call and handing chunks to `out`.
+pub fn listen(
+    direction: Direction,
+    endpoint: fn() -> Option<String>,
+    out: Sender<Vec<i16>>,
+    stop: &AtomicBool,
+) {
     supervise(
         stop,
         RETRY,
-        || Tap::open(Direction::Output, &endpoint().ok_or(SelectError::NoDevice)?),
+        || Tap::open(direction, &endpoint().ok_or(SelectError::NoDevice)?),
         |tap| {
             let result = tap.run(&endpoint, stop, |chunk| {
                 call().heard(is_speech(&chunk), Instant::now());

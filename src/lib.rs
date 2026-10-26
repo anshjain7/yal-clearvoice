@@ -3,6 +3,7 @@ pub mod capture;
 pub mod denoise;
 pub mod devices;
 pub mod driver;
+pub mod enhance;
 pub mod format;
 pub mod frame;
 pub mod ipc;
