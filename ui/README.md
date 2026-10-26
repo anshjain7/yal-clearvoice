@@ -96,7 +96,10 @@ through uncleaned whenever it falls more than 4 s behind, so call audio is
 never affected. After WeSep, a voice-match mute checks each stretch against
 the voice sample, a second at a time, and turns down by 30 dB whatever doesn't
 sound like the agent, such as a colleague talking while the agent is silent
-(WeSep alone lets that through).
+(WeSep alone lets that through). The mute is about 25 times lighter than
+WeSep: when WeSep can't clean a stretch in less time than it lasts (most
+15 W office laptops), the app leaves WeSep out for a minute and runs the mute
+alone, which still keeps out colleagues talking in turn with the agent.
 
 ## Protocol (the pipe contract)
 
