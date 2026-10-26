@@ -256,7 +256,15 @@ pub fn clean(backend: &Backend, input: Receiver<Vec<i16>>, out: Sender<Vec<i16>>
             // Speech enhancement only during a call: between calls nothing is
             // transcribed, and it would keep a core busy for nothing.
             let enhance = enhancer.as_mut().filter(|_| calling);
-            send(&audio, &audio, None, enhance, &mut dump, &out);
+            send(
+                &audio,
+                &audio,
+                None,
+                enhance,
+                &mut dump,
+                &out,
+                record::recording(),
+            );
             continue;
         }
         let Some(block) = blocks.push(&chunk) else {
@@ -275,17 +283,34 @@ pub fn clean(backend: &Backend, input: Receiver<Vec<i16>>, out: Sender<Vec<i16>>
                 (block.clone(), None)
             }
         };
-        send(&block, &tse, took, enhancer.as_mut(), &mut dump, &out);
+        send(
+            &block,
+            &tse,
+            took,
+            enhancer.as_mut(),
+            &mut dump,
+            &out,
+            record::recording(),
+        );
     }
     let rest = blocks.flush();
-    send(&rest, &rest, None, enhancer.as_mut(), &mut dump, &out);
+    send(
+        &rest,
+        &rest,
+        None,
+        enhancer.as_mut(),
+        &mut dump,
+        &out,
+        record::recording(),
+    );
     let _ = dump.close();
 }
 
 /// Hands the agent's voice on: `tse` (the block after TSE, which took
 /// `tse_took`; None when TSE didn't run) through speech enhancement
 /// (`enhancer`, when there is one) to the relay. While a call is being
-/// recorded, every stage goes to `dump`, with how long each step took.
+/// recorded (`recording`), every stage goes to `dump`, with how long each
+/// step took.
 fn send(
     raw: &[i16],
     tse: &[i16],
@@ -293,13 +318,14 @@ fn send(
     enhancer: Option<&mut Enhancer>,
     dump: &mut Dump,
     out: &Sender<Vec<i16>>,
+    recording: Option<PathBuf>,
 ) {
     let started = Instant::now();
     let (audio, se_took) = match enhancer {
         Some(e) => (e.process(tse), Some(started.elapsed())),
         None => (tse.to_vec(), None),
     };
-    dump.add(record::recording(), raw, tse, tse_took, &audio, se_took);
+    dump.add(recording, raw, tse, tse_took, &audio, se_took);
     for c in audio.chunks(CHUNK) {
         let _ = out.send(c.to_vec());
     }
@@ -1121,17 +1147,20 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("models/DeepFilterNet3_onnx.tar.gz")
     }
 
-    /// The team's configuration on this PC, block by block as during a call
-    /// (no pacing), on a recording: WeSep on every 2 s block, then speech
-    /// enhancement. Reports how long each block took and writes the result.
-    /// Set YAL_CLEAN_TEST to "<dir with onnxruntime.dll and wesep\\>|<voice
-    /// sample.wav>|<noisy recording.wav>|<output.wav>" (16 kHz mono WAV).
+    /// The team's configuration on this PC on a recording, block by block
+    /// through the same steps as `clean()` during a recorded call (no
+    /// pacing): WeSep on every 2 s block, then speech enhancement, saved by
+    /// the app's own `Dump`. The files land where a call recorded as
+    /// `<recording.wav>` would put them: `Agent voice\<recording>\` beside it
+    /// (input, audio_tse and audio_tse_se as M4A, and rtf.csv). Set
+    /// YAL_CLEAN_TEST to "<dir with onnxruntime.dll and wesep\>|<voice
+    /// sample.wav>|<noisy recording.wav>|<recording.wav>" (16 kHz mono WAV).
     /// cargo test --release extracts_then_enhances -- --ignored --nocapture
     #[test]
     #[ignore = "needs the WeSep files and test recordings"]
     fn extracts_then_enhances() {
         let spec = std::env::var("YAL_CLEAN_TEST").expect("set YAL_CLEAN_TEST");
-        let [dir, sample, input, output] = spec.split('|').collect::<Vec<_>>()[..] else {
+        let [dir, sample, input, recording] = spec.split('|').collect::<Vec<_>>()[..] else {
             panic!("YAL_CLEAN_TEST needs 4 parts");
         };
         let files = tse::Files::find(Path::new(dir)).expect("WeSep files");
@@ -1145,22 +1174,38 @@ mod tests {
             .iter()
             .map(|&c| i16::from_le_bytes(c))
             .collect();
-        let (mut blocks, mut cleaned) = (Blocks::default(), Vec::new());
+        let recording = Some(PathBuf::from(recording));
+        let (mut blocks, mut dump) = (Blocks::default(), Dump::new(true));
+        let (out, relay) = std::sync::mpsc::channel();
         for chunk in audio.chunks(CHUNK) {
             if let Some(block) = blocks.push(chunk) {
-                let t = Instant::now();
-                let c = local.extract(&block).unwrap();
-                cleaned.extend(enhancer.process(&c));
-                println!("block {:.2} s (2 threads)", t.elapsed().as_secs_f32());
+                let started = Instant::now();
+                let tse = local.extract(&block).unwrap();
+                let took = Some(started.elapsed());
+                let (e, d) = (Some(&mut enhancer), &mut dump);
+                send(&block, &tse, took, e, d, &out, recording.clone());
             }
         }
-        cleaned.extend(enhancer.process(&blocks.flush()));
-        // Speech enhancement works in 10 ms frames: silence after the end
-        // brings out the last part of one.
-        cleaned.extend(enhancer.process(&[0; CHUNK]));
-        assert!(cleaned.len() >= audio.len());
-        cleaned.truncate(audio.len());
-        record::write_wav(Path::new(output), &cleaned).unwrap();
+        let rest = blocks.flush();
+        send(
+            &rest,
+            &rest,
+            None,
+            Some(&mut enhancer),
+            &mut dump,
+            &out,
+            recording.clone(),
+        );
+        drop(out);
+        let sent: usize = relay.iter().map(|c| c.len()).sum();
+        println!("{} samples in, {sent} on to the transcript", audio.len());
+        dump.close().expect("a call's files").join().unwrap();
+        let dir = record::agent_voice_dir(recording.as_ref().unwrap());
+        println!("{}", fs::read_to_string(dir.join("rtf.csv")).unwrap());
+        for name in STAGES {
+            assert!(dir.join(format!("{name}.m4a")).is_file(), "{name}.m4a");
+        }
+        println!("written to {}", dir.display());
     }
 
     /// Against a real voice server (voice-server/voice_server.py): sends a
