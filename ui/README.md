@@ -96,12 +96,16 @@ On the PC it follows the team's configuration (`run_tse.sh`, then
 `run_se.sh`): WeSep works on the agent's raw microphone, before noise
 removal, on every 2 s of it one after another (no overlapping chunks), with
 no remix; then DeepFilterNet3 speech enhancement (at the `[noise]` limit)
-cleans the result. That's what the transcript and each recording's
-`cleaned voice.wav` get. It runs below normal priority, so call audio is
-never affected, and extracts every block whatever the PC's speed: on a PC
-slower than WeSep needs, the agent's side of the transcript falls further
-behind as the call goes on, and what's still waiting when the call ends
-isn't transcribed.
+cleans the result. That's what the transcript gets. It runs below normal
+priority, so call audio is never affected, and extracts every block whatever
+the PC's speed: on a PC slower than WeSep needs, the agent's side of the
+transcript falls further behind as the call goes on, and what's still
+waiting when the call ends isn't transcribed.
+
+While a call is recorded, the agent's own voice is saved before and after the
+models, covering the same stretch, in `Recordings\Agent voice\`:
+`<date time> noisy.wav` (the raw microphone the models get) and
+`<date time> cleaned.wav` (after WeSep and speech enhancement).
 
 ## Protocol (the pipe contract)
 
