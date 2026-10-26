@@ -102,10 +102,19 @@ the PC's speed: on a PC slower than WeSep needs, the agent's side of the
 transcript falls further behind as the call goes on, and what's still
 waiting when the call ends isn't transcribed.
 
-While a call is recorded, the agent's own voice is saved before and after the
-models, covering the same stretch, in `Recordings\Agent voice\`:
-`<date time> noisy.wav` (the raw microphone the models get) and
-`<date time> cleaned.wav` (after WeSep and speech enhancement).
+While a call is recorded, the agent's own voice is saved at each step, each
+covering the same stretch, in a folder per call,
+`Recordings\Agent voice\<date time>\`:
+
+- `input.m4a`: the raw microphone, what the models get;
+- `audio_tse.m4a`: after WeSep (TSE);
+- `audio_tse_se.m4a`: after speech enhancement too, what the transcript gets;
+- `rtf.csv`: each step's real-time factor (time it took / length of the
+  audio; under 1 keeps up), for every 2 s block and for the whole call.
+
+They're written as WAV during the call and made M4A once it's over, so the
+encoding takes nothing from the call; where Windows can't encode M4A ("N"
+editions without the Media Feature Pack), they stay WAV.
 
 ## Protocol (the pipe contract)
 
