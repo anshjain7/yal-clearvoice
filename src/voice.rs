@@ -17,6 +17,12 @@
 //! PC can't keep up it lets blocks through uncleaned until it has caught up.
 //! Whenever extraction isn't possible, the original audio is transcribed.
 //!
+//! WeSep's model was trained on two people talking at once, and lets through
+//! a colleague who talks while the agent is silent. So on this PC each block
+//! also goes through a voice-match mute: it's checked against the voice
+//! sample a second at a time, and the parts that don't sound like the agent
+//! are turned down (`[voice] mute_others`, on by default).
+//!
 //! The voice sample is 20 s of the agent speaking, recorded once from the
 //! cleaned voice (the same sound extraction later works on) and kept in
 //! `%LOCALAPPDATA%\YAL ClearVoice\Voice sample.wav`.
@@ -60,6 +66,20 @@ const SAMPLE_MIN_SPEECH: usize = 60;
 const OFF_AFTER_FAILURE: Duration = Duration::from_secs(30);
 /// Longest a request may take before the server counts as down.
 const TIMEOUT: Duration = Duration::from_secs(5);
+/// The voice-match mute checks 1 s windows of each block (with its context),
+/// one every 0.25 s; each sample gets the mean score of the windows over it.
+const MATCH_WINDOW: usize = RATE as usize;
+const MATCH_HOP: usize = RATE as usize / 4;
+/// Score (speaker embedding similarity to the voice sample) at or above which
+/// a part counts as the agent: their own speech scores about 0.3-0.6, other
+/// people about 0.
+const MATCH_THRESHOLD: f32 = 0.2;
+/// How far the other parts are turned down: 30 dB.
+const MUTE_GAIN: f32 = 0.031_6;
+/// Windows quieter than this (dBFS) aren't checked: there's nothing to remove.
+const MATCH_QUIET_DB: f32 = -45.0;
+/// Fade between kept and muted parts: 30 ms.
+const MUTE_RAMP: usize = RATE as usize * 3 / 100;
 
 /// `[voice]` from settings.ini.
 #[derive(Debug, Clone, PartialEq)]
@@ -110,13 +130,15 @@ pub enum Backend {
         remix: f32,
         /// Threads for the separator.
         threads: usize,
+        /// The voice-match mute.
+        mute: bool,
     },
 }
 
-/// `[voice]` remix (default 0.2) and threads (default 2, at most 8) for
-/// extraction on this PC.
-pub fn local_options(ini: &str) -> (f32, usize) {
-    let (mut section, mut remix, mut threads) = ("", 0.2f32, 2usize);
+/// `[voice]` remix (default 0.2), threads (default 2, at most 8) and
+/// mute_others (on unless off/no/false/0) for extraction on this PC.
+pub fn local_options(ini: &str) -> (f32, usize, bool) {
+    let (mut section, mut remix, mut threads, mut mute) = ("", 0.2f32, 2usize, true);
     for line in ini.trim_start_matches('\u{feff}').lines().map(str::trim) {
         if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
             section = name.trim();
@@ -128,11 +150,17 @@ pub fn local_options(ini: &str) -> (f32, usize) {
             match k.trim() {
                 "remix" => remix = v.parse().unwrap_or(remix).clamp(0.0, 1.0),
                 "threads" => threads = v.parse().unwrap_or(threads).clamp(1, 8),
+                "mute_others" => {
+                    mute = !matches!(
+                        v.to_ascii_lowercase().as_str(),
+                        "off" | "no" | "false" | "0"
+                    )
+                }
                 _ => {}
             }
         }
     }
-    (remix, threads)
+    (remix, threads, mute)
 }
 
 /// Where the agent's voice sample is kept.
@@ -226,7 +254,14 @@ pub fn clean(backend: &Backend, input: Receiver<Vec<i16>>, out: Sender<Vec<i16>>
             files,
             remix,
             threads,
-        } => Engine::Local(Box::new(Local::new(files, *remix, *threads, sample_path()))),
+            mute,
+        } => Engine::Local(Box::new(Local::new(
+            files,
+            *remix,
+            *threads,
+            *mute,
+            sample_path(),
+        ))),
     };
     let mut blocks = Blocks::default();
     let mut off_until: Option<Instant> = None;
@@ -385,6 +420,7 @@ struct Local {
     files: tse::Files,
     remix: f32,
     threads: usize,
+    mute: bool,
     sample: PathBuf,
     model: Option<tse::Extractor>,
     /// The voice sample's embedding, and the sample's time when computed.
@@ -392,7 +428,7 @@ struct Local {
 }
 
 impl Local {
-    fn new(files: &tse::Files, remix: f32, threads: usize, sample: PathBuf) -> Local {
+    fn new(files: &tse::Files, remix: f32, threads: usize, mute: bool, sample: PathBuf) -> Local {
         let files = tse::Files {
             runtime: files.runtime.clone(),
             speaker: files.speaker.clone(),
@@ -402,6 +438,7 @@ impl Local {
             files,
             remix,
             threads,
+            mute,
             sample,
             model: None,
             embedding: None,
@@ -442,12 +479,68 @@ impl Local {
             .map(|&s| f32::from(s) / 32768.0)
             .collect();
         let est = model.extract(embedding, &mix)?;
-        let out = tse::remix(&est, &mix, self.remix);
+        let mut out = tse::remix(&est, &mix, self.remix);
+        if self.mute {
+            let gains = match_gains(&mix, |w| Ok(tse::similarity(&model.enroll(w)?, embedding)))?;
+            out.iter_mut().zip(gains).for_each(|(v, g)| *v *= g);
+        }
         Ok(out[context.len()..]
             .iter()
             .map(|v| (v.clamp(-1.0, 1.0) * 32767.0) as i16)
             .collect())
     }
+}
+
+/// The voice-match mute's gain for each sample of `mix` (a block with its
+/// context): 1 where it sounds like the agent, `MUTE_GAIN` elsewhere, with
+/// short fades. `score` rates a window against the voice sample.
+fn match_gains(
+    mix: &[f32],
+    mut score: impl FnMut(&[f32]) -> Result<f32, String>,
+) -> Result<Vec<f32>, String> {
+    let n = mix.len();
+    let (mut sum, mut count) = (vec![0f32; n], vec![0u32; n]);
+    let mut starts: Vec<usize> = (0..=n.saturating_sub(MATCH_WINDOW))
+        .step_by(MATCH_HOP)
+        .collect();
+    // One more window flush with the end, so every sample is covered.
+    if let Some(&last) = starts.last()
+        && last + MATCH_WINDOW < n
+    {
+        starts.push(n - MATCH_WINDOW);
+    }
+    for s in starts {
+        let w = &mix[s..(s + MATCH_WINDOW).min(n)];
+        let rms = (w.iter().map(|v| v * v).sum::<f32>() / w.len().max(1) as f32).sqrt();
+        let sc = if 20.0 * (rms + 1e-9).log10() > MATCH_QUIET_DB {
+            score(w)?
+        } else {
+            1.0
+        };
+        for i in s..s + w.len() {
+            sum[i] += sc;
+            count[i] += 1;
+        }
+    }
+    let keep: Vec<f32> = sum
+        .iter()
+        .zip(&count)
+        .map(|(&s, &c)| f32::from(u8::from(c == 0 || s / c as f32 >= MATCH_THRESHOLD)))
+        .collect();
+    // Fades: each gain is the mean of `keep` over MUTE_RAMP around it (only
+    // over samples that exist, so the block's ends aren't faded).
+    let mut prefix = vec![0f32; n + 1];
+    for (i, k) in keep.iter().enumerate() {
+        prefix[i + 1] = prefix[i] + k;
+    }
+    let half = MUTE_RAMP / 2;
+    Ok((0..n)
+        .map(|i| {
+            let (a, b) = (i.saturating_sub(half), (i + half + 1).min(n));
+            let k = (prefix[b] - prefix[a]) / (b - a) as f32;
+            MUTE_GAIN + (1.0 - MUTE_GAIN) * k
+        })
+        .collect())
 }
 
 /// The voice sample as samples in -1..1 (record_sample's own 16 kHz WAV).
@@ -720,16 +813,62 @@ mod tests {
 
     #[test]
     fn local_options_have_defaults_and_limits() {
-        assert_eq!(local_options(""), (0.2, 2));
+        assert_eq!(local_options(""), (0.2, 2, true));
         assert_eq!(
             local_options("[voice]\nremix = 0.3\nthreads = 4 ; faster PC\n"),
-            (0.3, 4)
+            (0.3, 4, true)
         );
         assert_eq!(
-            local_options("[voice]\nthreads = 64\nremix = 7\n"),
-            (1.0, 8)
+            local_options("[voice]\nthreads = 64\nremix = 7\nmute_others = Off\n"),
+            (1.0, 8, false)
         );
-        assert_eq!(local_options("[noise]\nthreads = 4\n"), (0.2, 2));
+        assert_eq!(
+            local_options("[voice]\nmute_others = on ; default\n"),
+            (0.2, 2, true)
+        );
+        assert_eq!(
+            local_options("[noise]\nthreads = 4\nmute_others = 0\n"),
+            (0.2, 2, true)
+        );
+    }
+
+    #[test]
+    fn mute_keeps_the_agent_and_turns_others_down() {
+        // 4 s at a steady level: the agent in the first 2 s, someone else
+        // after (the score function plays the voice matcher).
+        let mix = vec![0.1f32; 4 * RATE as usize];
+        let half = mix.len() / 2;
+        let gains = match_gains(&mix, |w| {
+            let start = w.as_ptr() as usize - mix.as_ptr() as usize;
+            let agent = start / 4 + w.len() / 2 <= half; // window mostly the agent
+            Ok(if agent { 0.5 } else { 0.0 })
+        })
+        .unwrap();
+        assert_eq!(gains.len(), mix.len());
+        assert!(
+            gains[..half - RATE as usize / 2]
+                .iter()
+                .all(|&g| (g - 1.0).abs() < 1e-6)
+        );
+        assert!(
+            gains[half + RATE as usize / 2..]
+                .iter()
+                .all(|&g| g == MUTE_GAIN)
+        );
+        // The change is a short fade, never a jump.
+        assert!(gains.windows(2).all(|p| (p[0] - p[1]).abs() < 0.01));
+        // Near silence isn't checked, so nothing is turned down.
+        let quiet = vec![0.0001f32; 2 * RATE as usize];
+        let gains = match_gains(&quiet, |_| -> Result<f32, String> { panic!("checked") }).unwrap();
+        assert!(gains.iter().all(|&g| (g - 1.0).abs() < 1e-6));
+        // A block shorter than one window is checked as a whole.
+        let short = vec![0.1f32; RATE as usize / 2];
+        assert!(
+            match_gains(&short, |_| Ok(0.0))
+                .unwrap()
+                .iter()
+                .all(|&g| g == MUTE_GAIN)
+        );
     }
 
     #[test]
@@ -919,6 +1058,7 @@ mod tests {
             files,
             remix: 0.2,
             threads: 2,
+            mute: true,
         };
         transcribe::enable();
         transcribe::start_call();
@@ -957,6 +1097,46 @@ mod tests {
         println!("{changed} of {} blocks cleaned", audio.len() / BLOCK);
         assert!(changed > 0, "nothing was cleaned");
         record::write_wav(Path::new(output), &got[..audio.len()]).unwrap();
+    }
+
+    /// WeSep plus the voice-match mute on this PC, block by block as during a
+    /// call (every block cleaned, no pacing), on a recording: reports how
+    /// long each block took and writes the result. Set YAL_MUTE_TEST to
+    /// "<dir with onnxruntime.dll and wesep\\>|<voice sample.wav>|<noisy
+    /// recording.wav>|<output.wav>" (16 kHz mono WAV); YAL_MUTE_OFF too to
+    /// time it without the mute.
+    /// cargo test --release mutes_on_this_pc -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs the WeSep files and test recordings"]
+    fn mutes_on_this_pc() {
+        let spec = std::env::var("YAL_MUTE_TEST").expect("set YAL_MUTE_TEST");
+        let [dir, sample, input, output] = spec.split('|').collect::<Vec<_>>()[..] else {
+            panic!("YAL_MUTE_TEST needs 4 parts");
+        };
+        let files = tse::Files::find(Path::new(dir)).expect("WeSep files");
+        let mute = std::env::var_os("YAL_MUTE_OFF").is_none();
+        let mut local = Local::new(&files, 0.2, 2, mute, PathBuf::from(sample));
+        let b = fs::read(input).unwrap();
+        let audio: Vec<i16> = b[44..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| i16::from_le_bytes(c))
+            .collect();
+        let (mut blocks, mut cleaned) = (Blocks::default(), Vec::new());
+        for chunk in audio.chunks(CHUNK) {
+            if let Some((context, block)) = blocks.push(chunk) {
+                let t = Instant::now();
+                cleaned.extend(local.extract(&context, &block).unwrap());
+                println!(
+                    "block {:.2} s (2 threads, mute {mute})",
+                    t.elapsed().as_secs_f32()
+                );
+            }
+        }
+        cleaned.extend(blocks.flush());
+        assert_eq!(cleaned.len(), audio.len());
+        record::write_wav(Path::new(output), &cleaned).unwrap();
     }
 
     /// Against a real voice server (voice-server/voice_server.py): sends a
