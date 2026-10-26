@@ -8,37 +8,29 @@
 //! `[voice]` server from settings.ini. Only the transcript is affected; the
 //! call itself still gets the voice straight from noise removal.
 //!
-//! On this PC it follows the team's best configuration:
+//! On this PC it follows the team's configuration:
 //!
-//!   run_tse.sh --enroll <voice sample> --input <microphone> --chunk_sec 3.0 --overlap_sec 1.0
+//!   run_tse.sh --enroll <voice sample> --input <microphone>
 //!   run_se.sh <that> <transcript>
 //!
-//! WeSep works on the raw microphone (before any noise removal) in 3 s
-//! chunks, each 1 s of earlier audio and 2 s new, the overlapping second
-//! crossfaded with the chunk before, with nothing of the original mixed back
-//! in; then speech enhancement (enhance.rs, DeepFilterNet3) cleans the
-//! result. So the agent's lines reach the transcript a few seconds later.
-//! (A `[voice]` server instead works on the call's cleaned voice, as before.)
+//! WeSep works on the raw microphone (before any noise removal), on every
+//! 2 s of it one after another (no overlapping chunks), with nothing of the
+//! original mixed back in; then speech enhancement (enhance.rs,
+//! DeepFilterNet3) cleans the result. So the agent's lines reach the
+//! transcript a few seconds later. (A `[voice]` server instead works on the
+//! call's cleaned voice, as before.)
 //!
 //! On this PC it stays out of the call's way: it runs on its own thread below
 //! normal priority (noise removal and the audio threads run at Pro Audio
-//! priority above it), cleans only chunks with speech in them, and when the
-//! PC can't keep up it lets chunks through without extraction until it has
-//! caught up. Whenever extraction isn't possible, the agent's voice is still
-//! enhanced and transcribed.
-//!
-//! WeSep can't keep up on most 15 W office laptops. Then a voice-match mute
-//! takes its place (`[voice] mute_others`, on by default): each chunk is
-//! checked against the voice sample a second at a time, and the parts that
-//! don't sound like the agent are turned down, before speech enhancement as
-//! well. It costs about a tenth of WeSep, and still keeps out a colleague
-//! talking in turn with the agent, though not one talking over them.
+//! priority above it). It extracts every block, whatever the PC's speed: on
+//! a PC slower than WeSep needs, the transcript falls further behind the
+//! call as it goes on. Only when extraction fails is the agent's voice
+//! transcribed without it (still enhanced).
 //!
 //! The voice sample is 20 s of the agent speaking, recorded once from the
 //! cleaned voice (the same sound extraction later works on) and kept in
 //! `%LOCALAPPDATA%\YAL ClearVoice\Voice sample.wav`.
 
-use std::collections::VecDeque;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -55,24 +47,8 @@ use crate::record;
 use crate::transcribe::{self, CHUNK, RATE, Tap};
 use crate::tse;
 
-/// New audio per chunk: 2 s.
+/// Audio cleaned at a time: 2 s, one block after another.
 const BLOCK: usize = 2 * RATE as usize;
-/// Audio before each block that goes into its chunk too: 1 s, so chunks are
-/// 3 s overlapping by 1 s (run_tse.sh --chunk_sec 3.0 --overlap_sec 1.0).
-const CONTEXT: usize = RATE as usize;
-/// One block, in time.
-const BLOCK_TIME: Duration = Duration::from_secs(2);
-/// Blocks with less speech than this (100 ms chunks) go on uncleaned: after
-/// noise removal the agent's side is nearly silent between words, so they
-/// hold no voices worth removing, and skipping them about halves the work.
-const MIN_SPEECH: usize = 3;
-/// How far behind the call cleaning may fall (a slow PC) before blocks go
-/// on uncleaned until it has caught up, so the transcript never lags more.
-const MAX_BEHIND: Duration = Duration::from_secs(4);
-/// After WeSep takes longer than a block to clean one (the PC can't keep up
-/// with it), blocks get only the voice-match mute for this long, so a slow
-/// PC isn't kept busy with WeSep it can't finish in time.
-const WESEP_REST: Duration = Duration::from_secs(60);
 /// How long the voice sample is.
 pub const SAMPLE_SECONDS: usize = 20;
 /// Speech the sample must hold to be any use: 6 s.
@@ -82,20 +58,6 @@ const SAMPLE_MIN_SPEECH: usize = 60;
 const OFF_AFTER_FAILURE: Duration = Duration::from_secs(30);
 /// Longest a request may take before the server counts as down.
 const TIMEOUT: Duration = Duration::from_secs(5);
-/// The voice-match mute checks 1 s windows of each block (with its context),
-/// one every 0.25 s; each sample gets the mean score of the windows over it.
-const MATCH_WINDOW: usize = RATE as usize;
-const MATCH_HOP: usize = RATE as usize / 4;
-/// Score (speaker embedding similarity to the voice sample) at or above which
-/// a part counts as the agent: their own speech scores about 0.3-0.6, other
-/// people about 0.
-const MATCH_THRESHOLD: f32 = 0.2;
-/// How far the other parts are turned down: 30 dB.
-const MUTE_GAIN: f32 = 0.031_6;
-/// Windows quieter than this (dBFS) aren't checked: there's nothing to remove.
-const MATCH_QUIET_DB: f32 = -45.0;
-/// Fade between kept and muted parts: 30 ms.
-const MUTE_RAMP: usize = RATE as usize * 3 / 100;
 
 /// `[voice]` from settings.ini.
 #[derive(Debug, Clone, PartialEq)]
@@ -147,18 +109,15 @@ pub enum Backend {
         remix: f32,
         /// Threads for the separator.
         threads: usize,
-        /// The voice-match mute, when WeSep can't keep up.
-        mute: bool,
         /// DeepFilterNet3 for speech enhancement, and its attenuation limit.
         enhance: (PathBuf, f32),
     },
 }
 
-/// `[voice]` remix (default 0: run_tse.sh without --remix), threads (default
-/// 2, at most 8) and mute_others (on unless off/no/false/0) for extraction on
-/// this PC.
-pub fn local_options(ini: &str) -> (f32, usize, bool) {
-    let (mut section, mut remix, mut threads, mut mute) = ("", 0.0f32, 2usize, true);
+/// `[voice]` remix (default 0: run_tse.sh without --remix) and threads
+/// (default 2, at most 8) for extraction on this PC.
+pub fn local_options(ini: &str) -> (f32, usize) {
+    let (mut section, mut remix, mut threads) = ("", 0.0f32, 2usize);
     for line in ini.trim_start_matches('\u{feff}').lines().map(str::trim) {
         if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
             section = name.trim();
@@ -170,17 +129,11 @@ pub fn local_options(ini: &str) -> (f32, usize, bool) {
             match k.trim() {
                 "remix" => remix = v.parse().unwrap_or(remix).clamp(0.0, 1.0),
                 "threads" => threads = v.parse().unwrap_or(threads).clamp(1, 8),
-                "mute_others" => {
-                    mute = !matches!(
-                        v.to_ascii_lowercase().as_str(),
-                        "off" | "no" | "false" | "0"
-                    )
-                }
                 _ => {}
             }
         }
     }
-    (remix, threads, mute)
+    (remix, threads)
 }
 
 /// Where the agent's voice sample is kept.
@@ -263,11 +216,11 @@ pub fn import_sample(file: &Path, path: &Path) {
 }
 
 /// Sits between the agent side's listener and its Sarvam relay: while a call
-/// is being transcribed and there's a voice sample, cleans the audio in 3 s
-/// chunks overlapping by 1 s and passes on the result; otherwise, or when
-/// extraction fails, passes the audio on without extraction. On this PC
-/// everything passed on during a call then goes through speech enhancement.
-/// Runs until `input` closes.
+/// is being transcribed and there's a voice sample, extracts the agent's
+/// voice from every 2 s block and passes on the result; otherwise, or when
+/// extraction fails, passes the audio on without it. On this PC everything
+/// passed on during a call then goes through speech enhancement. Runs until
+/// `input` closes.
 pub fn clean(backend: &Backend, input: Receiver<Vec<i16>>, out: Sender<Vec<i16>>) {
     below_normal_priority();
     let (mut engine, mut enhancer) = match backend {
@@ -279,25 +232,16 @@ pub fn clean(backend: &Backend, input: Receiver<Vec<i16>>, out: Sender<Vec<i16>>
             files,
             remix,
             threads,
-            mute,
             enhance: (model, attenuation),
         } => (
-            Engine::Local(Box::new(Local::new(
-                files,
-                *remix,
-                *threads,
-                *mute,
-                sample_path(),
-            ))),
+            Engine::Local(Box::new(Local::new(files, *remix, *threads, sample_path()))),
             // Without it the agent's voice is transcribed unenhanced: noisier,
             // but nothing is lost.
             Enhancer::new(model, *attenuation).ok(),
         ),
     };
     let mut blocks = Blocks::default();
-    let mut joiner = Joiner::default();
     let mut off_until: Option<Instant> = None;
-    let mut pacer = Pacer::default();
     // While the call is also being recorded: its cleaned voice, saved next to it.
     let mut saver = Saver::default();
     for chunk in input {
@@ -305,50 +249,34 @@ pub fn clean(backend: &Backend, input: Receiver<Vec<i16>>, out: Sender<Vec<i16>>
         let on =
             calling && engine.sample().is_file() && off_until.is_none_or(|t| Instant::now() >= t);
         if !on {
-            // Audio held for a chunk that won't be cleaned goes on as it is.
-            let mut audio = joiner.flush();
-            audio.extend(blocks.flush());
+            // Audio held for a block that won't be cleaned goes on as it is.
+            let mut audio = blocks.flush();
             audio.extend(&chunk);
             let registered = engine.sample().is_file();
             // Speech enhancement only during a call: between calls nothing is
             // transcribed, and it would keep a core busy for nothing.
             let enhance = enhancer.as_mut().filter(|_| calling);
             send(&audio, enhance, registered, &mut saver, &out);
-            blocks.remember(&chunk);
             continue;
         }
-        let Some((context, block)) = blocks.push(&chunk) else {
+        let Some(block) = blocks.push(&chunk) else {
             continue;
         };
-        let speech = block
-            .chunks(CHUNK)
-            .filter(|c| transcribe::is_speech(c))
-            .count();
-        let started = Instant::now();
-        let step = pacer.step(speech, started);
-        let whole = || [context.as_slice(), &block].concat();
-        let cleaned = if step == Step::Raw {
-            whole()
-        } else {
-            match engine.extract(&context, &block, step == Step::Full) {
-                Ok(cleaned) => {
-                    set_state(ipc::VOICE_READY);
-                    off_until = None;
-                    cleaned
-                }
-                Err(_) => {
-                    set_state(engine.failed_state());
-                    off_until = Some(Instant::now() + OFF_AFTER_FAILURE);
-                    whole()
-                }
+        let cleaned = match engine.extract(&block) {
+            Ok(cleaned) => {
+                set_state(ipc::VOICE_READY);
+                off_until = None;
+                cleaned
+            }
+            Err(_) => {
+                set_state(engine.failed_state());
+                off_until = Some(Instant::now() + OFF_AFTER_FAILURE);
+                block
             }
         };
-        let ready = joiner.push(&cleaned, context.len());
-        send(&ready, enhancer.as_mut(), true, &mut saver, &out);
-        // Speech enhancement counts too: it's on this thread's time.
-        pacer.done(step, started.elapsed(), Instant::now());
+        send(&cleaned, enhancer.as_mut(), true, &mut saver, &out);
     }
-    send(&joiner.flush(), enhancer.as_mut(), true, &mut saver, &out);
+    send(&blocks.flush(), enhancer.as_mut(), true, &mut saver, &out);
     saver.save(false, None, &[]);
 }
 
@@ -368,84 +296,6 @@ fn send(
     for c in audio.chunks(CHUNK) {
         saver.save(registered, record::recording(), c);
         let _ = out.send(c.to_vec());
-    }
-}
-
-/// Joins cleaned chunks (`CONTEXT` of earlier audio, then a block) into one
-/// stream, as run_tse.sh's --overlap_sec: each chunk's last `CONTEXT` is held
-/// back and crossfaded with the next chunk's first, the same stretch of audio.
-#[derive(Default)]
-struct Joiner {
-    held: Vec<i16>,
-}
-
-impl Joiner {
-    /// Adds a chunk whose first `context` samples overlap the last one; returns
-    /// the audio now ready to go on.
-    fn push(&mut self, chunk: &[i16], context: usize) -> Vec<i16> {
-        let (head, rest) = chunk.split_at(context.min(chunk.len()));
-        let mut out = Vec::with_capacity(chunk.len());
-        if self.held.len() == head.len() {
-            let n = head.len().max(1) as f32;
-            out.extend(self.held.iter().zip(head).enumerate().map(|(i, (&a, &b))| {
-                let w = (i as f32 + 0.5) / n;
-                (f32::from(a) * (1.0 - w) + f32::from(b) * w) as i16
-            }));
-        } else {
-            // Nothing held (the overlap already went on as it was).
-            out.append(&mut self.held);
-        }
-        let keep = rest.len().saturating_sub(CONTEXT);
-        out.extend_from_slice(&rest[..keep]);
-        self.held = rest[keep..].to_vec();
-        out
-    }
-
-    /// Lets go of what's held back.
-    fn flush(&mut self) -> Vec<i16> {
-        std::mem::take(&mut self.held)
-    }
-}
-
-/// What happens to one chunk.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Step {
-    /// Goes on without extraction.
-    Raw,
-    /// The voice-match mute, in WeSep's place.
-    MuteOnly,
-    /// WeSep.
-    Full,
-}
-
-/// Picks each block's step from how well the PC is keeping up: WeSep only
-/// while it can clean a block in less time than the block lasts, else the
-/// mute alone, and nothing while even that has fallen too far behind.
-#[derive(Default)]
-struct Pacer {
-    /// How far behind the call cleaning has fallen.
-    behind: Duration,
-    /// WeSep is left out until then, after a block it couldn't clean in time.
-    wesep_rest: Option<Instant>,
-}
-
-impl Pacer {
-    fn step(&self, speech: usize, now: Instant) -> Step {
-        if speech < MIN_SPEECH || self.behind > MAX_BEHIND {
-            Step::Raw
-        } else if self.behind > BLOCK_TIME || self.wesep_rest.is_some_and(|t| now < t) {
-            Step::MuteOnly
-        } else {
-            Step::Full
-        }
-    }
-
-    /// Notes a block's step and how long it took.
-    fn done(&mut self, step: Step, took: Duration, now: Instant) {
-        self.behind = (self.behind + took).saturating_sub(BLOCK_TIME);
-        if step == Step::Full && took > BLOCK_TIME {
-            self.wesep_rest = Some(now + WESEP_REST);
-        }
     }
 }
 
@@ -478,41 +328,23 @@ impl Saver {
     }
 }
 
-/// Gathers audio into blocks, each with the second before it as context.
+/// Gathers audio into 2 s blocks, one after another.
 #[derive(Default)]
 struct Blocks {
-    /// The latest audio, up to `CONTEXT`, whether or not it was cleaned.
-    recent: VecDeque<i16>,
     /// Audio for the block being gathered.
     block: Vec<i16>,
 }
 
 impl Blocks {
-    /// Adds a chunk; once a block is full, returns its context and the block.
-    fn push(&mut self, chunk: &[i16]) -> Option<(Vec<i16>, Vec<i16>)> {
+    /// Adds a chunk; once a block is full, returns it.
+    fn push(&mut self, chunk: &[i16]) -> Option<Vec<i16>> {
         self.block.extend_from_slice(chunk);
-        if self.block.len() < BLOCK {
-            return None;
-        }
-        let context: Vec<i16> = self.recent.iter().copied().collect();
-        let block = std::mem::take(&mut self.block);
-        self.remember(&block);
-        Some((context, block))
-    }
-
-    /// Notes audio that went on without being cleaned, as context.
-    fn remember(&mut self, audio: &[i16]) {
-        self.recent.extend(audio);
-        while self.recent.len() > CONTEXT {
-            self.recent.pop_front();
-        }
+        (self.block.len() >= BLOCK).then(|| std::mem::take(&mut self.block))
     }
 
     /// Takes the audio gathered so far for a block.
     fn flush(&mut self) -> Vec<i16> {
-        let block = std::mem::take(&mut self.block);
-        self.remember(&block);
-        block
+        std::mem::take(&mut self.block)
     }
 }
 
@@ -530,20 +362,11 @@ impl Engine {
         }
     }
 
-    /// The cleaned chunk (`context` then `block`): WeSep when `separate`, else
-    /// the mute in its place (which the server doesn't do: its chunks then go
-    /// on as they are). The server cleans only the block; its context is
-    /// returned as it was.
-    fn extract(
-        &mut self,
-        context: &[i16],
-        block: &[i16],
-        separate: bool,
-    ) -> Result<Vec<i16>, String> {
+    /// The agent's voice extracted from `block` (same length).
+    fn extract(&mut self, block: &[i16]) -> Result<Vec<i16>, String> {
         match self {
-            Engine::Server(c) if separate => Ok([context, &c.extract(context, block)?].concat()),
-            Engine::Server(_) => Ok([context, block].concat()),
-            Engine::Local(l) => l.extract(context, block, separate),
+            Engine::Server(c) => c.extract(&[], block),
+            Engine::Local(l) => l.extract(block),
         }
     }
 
@@ -562,7 +385,6 @@ struct Local {
     files: tse::Files,
     remix: f32,
     threads: usize,
-    mute: bool,
     sample: PathBuf,
     model: Option<tse::Extractor>,
     /// The voice sample's embedding, and the sample's time when computed.
@@ -570,7 +392,7 @@ struct Local {
 }
 
 impl Local {
-    fn new(files: &tse::Files, remix: f32, threads: usize, mute: bool, sample: PathBuf) -> Local {
+    fn new(files: &tse::Files, remix: f32, threads: usize, sample: PathBuf) -> Local {
         let files = tse::Files {
             runtime: files.runtime.clone(),
             speaker: files.speaker.clone(),
@@ -580,7 +402,6 @@ impl Local {
             files,
             remix,
             threads,
-            mute,
             sample,
             model: None,
             embedding: None,
@@ -598,17 +419,8 @@ impl Local {
         Ok(self.model.as_mut().expect("just loaded"))
     }
 
-    /// WeSep when `separate`, else the mute (when on), on the chunk `context`
-    /// then `block`; returns the whole chunk.
-    fn extract(
-        &mut self,
-        context: &[i16],
-        block: &[i16],
-        separate: bool,
-    ) -> Result<Vec<i16>, String> {
-        if !separate && !self.mute {
-            return Ok([context, block].concat());
-        }
+    /// WeSep on `block`, with the voice sample as the enrollment.
+    fn extract(&mut self, block: &[i16]) -> Result<Vec<i16>, String> {
         let modified = fs::metadata(&self.sample)
             .and_then(|m| m.modified())
             .map_err(|e| e.to_string())?;
@@ -625,75 +437,13 @@ impl Local {
         }
         let model = self.model.as_mut().expect("loaded above");
         let embedding = &self.embedding.as_ref().expect("enrolled above").0;
-        let mix: Vec<f32> = context
-            .iter()
-            .chain(block)
-            .map(|&s| f32::from(s) / 32768.0)
-            .collect();
-        let out = if separate {
-            let est = model.extract(embedding, &mix)?;
-            tse::remix(&est, &mix, self.remix)
-        } else {
-            let gains = match_gains(&mix, |w| Ok(tse::similarity(&model.enroll(w)?, embedding)))?;
-            mix.iter().zip(gains).map(|(v, g)| v * g).collect()
-        };
-        Ok(out
+        let mix: Vec<f32> = block.iter().map(|&s| f32::from(s) / 32768.0).collect();
+        let est = model.extract(embedding, &mix)?;
+        Ok(tse::remix(&est, &mix, self.remix)
             .iter()
             .map(|v| (v.clamp(-1.0, 1.0) * 32767.0) as i16)
             .collect())
     }
-}
-
-/// The voice-match mute's gain for each sample of `mix` (a block with its
-/// context): 1 where it sounds like the agent, `MUTE_GAIN` elsewhere, with
-/// short fades. `score` rates a window against the voice sample.
-fn match_gains(
-    mix: &[f32],
-    mut score: impl FnMut(&[f32]) -> Result<f32, String>,
-) -> Result<Vec<f32>, String> {
-    let n = mix.len();
-    let (mut sum, mut count) = (vec![0f32; n], vec![0u32; n]);
-    let mut starts: Vec<usize> = (0..=n.saturating_sub(MATCH_WINDOW))
-        .step_by(MATCH_HOP)
-        .collect();
-    // One more window flush with the end, so every sample is covered.
-    if let Some(&last) = starts.last()
-        && last + MATCH_WINDOW < n
-    {
-        starts.push(n - MATCH_WINDOW);
-    }
-    for s in starts {
-        let w = &mix[s..(s + MATCH_WINDOW).min(n)];
-        let rms = (w.iter().map(|v| v * v).sum::<f32>() / w.len().max(1) as f32).sqrt();
-        let sc = if 20.0 * (rms + 1e-9).log10() > MATCH_QUIET_DB {
-            score(w)?
-        } else {
-            1.0
-        };
-        for i in s..s + w.len() {
-            sum[i] += sc;
-            count[i] += 1;
-        }
-    }
-    let keep: Vec<f32> = sum
-        .iter()
-        .zip(&count)
-        .map(|(&s, &c)| f32::from(u8::from(c == 0 || s / c as f32 >= MATCH_THRESHOLD)))
-        .collect();
-    // Fades: each gain is the mean of `keep` over MUTE_RAMP around it (only
-    // over samples that exist, so the block's ends aren't faded).
-    let mut prefix = vec![0f32; n + 1];
-    for (i, k) in keep.iter().enumerate() {
-        prefix[i + 1] = prefix[i] + k;
-    }
-    let half = MUTE_RAMP / 2;
-    Ok((0..n)
-        .map(|i| {
-            let (a, b) = (i.saturating_sub(half), (i + half + 1).min(n));
-            let k = (prefix[b] - prefix[a]) / (b - a) as f32;
-            MUTE_GAIN + (1.0 - MUTE_GAIN) * k
-        })
-        .collect())
 }
 
 /// The voice sample as samples in -1..1 (record_sample's own 16 kHz WAV).
@@ -967,117 +717,16 @@ mod tests {
     #[test]
     fn local_options_have_defaults_and_limits() {
         // No remix by default: run_tse.sh without --remix.
-        assert_eq!(local_options(""), (0.0, 2, true));
+        assert_eq!(local_options(""), (0.0, 2));
         assert_eq!(
             local_options("[voice]\nremix = 0.3\nthreads = 4 ; faster PC\n"),
-            (0.3, 4, true)
+            (0.3, 4)
         );
         assert_eq!(
-            local_options("[voice]\nthreads = 64\nremix = 7\nmute_others = Off\n"),
-            (1.0, 8, false)
+            local_options("[voice]\nthreads = 64\nremix = 7\n"),
+            (1.0, 8)
         );
-        assert_eq!(
-            local_options("[voice]\nmute_others = on ; default\n"),
-            (0.0, 2, true)
-        );
-        assert_eq!(
-            local_options("[noise]\nthreads = 4\nmute_others = 0\n"),
-            (0.0, 2, true)
-        );
-    }
-
-    #[test]
-    fn joiner_crossfades_the_overlapping_second() {
-        let mut j = Joiner::default();
-        // The first chunk has no earlier audio: its first second goes on now,
-        // its last second is held back.
-        let first: Vec<i16> = vec![100; BLOCK];
-        let out = j.push(&first, 0);
-        assert_eq!(out, vec![100; BLOCK - CONTEXT]);
-        // The next chunk starts with that same second, cleaned differently:
-        // the two are crossfaded, from the old version to the new.
-        let next: Vec<i16> = [vec![300; CONTEXT], vec![500; BLOCK]].concat();
-        let out = j.push(&next, CONTEXT);
-        assert_eq!(out.len(), BLOCK);
-        assert!((out[0] - 100).abs() <= 1 && (out[CONTEXT - 1] - 300).abs() <= 1);
-        assert!(out[..CONTEXT].windows(2).all(|p| p[0] <= p[1]));
-        assert!(out[CONTEXT..].iter().all(|&v| v == 500));
-        // Every sample in comes out once: the rest on flush.
-        assert_eq!(j.flush(), vec![500; CONTEXT]);
-        // After a flush the overlap has already gone on: it's not repeated.
-        let out = j.push(&[vec![7; CONTEXT], vec![9; BLOCK]].concat(), CONTEXT);
-        assert_eq!(out, vec![9; BLOCK - CONTEXT]);
-    }
-
-    #[test]
-    fn pacer_drops_wesep_when_the_pc_cant_keep_up() {
-        let t0 = Instant::now();
-        let secs = Duration::from_secs_f32;
-        let mut p = Pacer::default();
-        // Little speech: nothing to clean.
-        assert_eq!(p.step(MIN_SPEECH - 1, t0), Step::Raw);
-        // A fast PC: WeSep every time.
-        for _ in 0..5 {
-            assert_eq!(p.step(10, t0), Step::Full);
-            p.done(Step::Full, secs(1.5), t0);
-        }
-        // WeSep took longer than the block: the mute alone, for WESEP_REST.
-        p.done(Step::Full, secs(2.5), t0);
-        assert_eq!(p.step(10, t0), Step::MuteOnly);
-        p.done(Step::MuteOnly, secs(0.2), t0);
-        assert_eq!(p.behind, Duration::ZERO);
-        assert_eq!(p.step(10, t0 + WESEP_REST / 2), Step::MuteOnly);
-        // Then WeSep is tried again.
-        assert_eq!(p.step(10, t0 + WESEP_REST), Step::Full);
-        // Far behind (a busy PC): the mute alone, then nothing until caught up.
-        let mut p = Pacer::default();
-        p.done(Step::MuteOnly, secs(5.0), t0);
-        assert_eq!(p.step(10, t0), Step::MuteOnly);
-        p.done(Step::MuteOnly, secs(4.0), t0);
-        assert_eq!(p.step(10, t0), Step::Raw);
-        p.done(Step::Raw, Duration::ZERO, t0);
-        assert_eq!(p.step(10, t0), Step::MuteOnly);
-        p.done(Step::Raw, Duration::ZERO, t0);
-        assert_eq!(p.step(10, t0), Step::Full);
-    }
-
-    #[test]
-    fn mute_keeps_the_agent_and_turns_others_down() {
-        // 4 s at a steady level: the agent in the first 2 s, someone else
-        // after (the score function plays the voice matcher).
-        let mix = vec![0.1f32; 4 * RATE as usize];
-        let half = mix.len() / 2;
-        let gains = match_gains(&mix, |w| {
-            let start = w.as_ptr() as usize - mix.as_ptr() as usize;
-            let agent = start / 4 + w.len() / 2 <= half; // window mostly the agent
-            Ok(if agent { 0.5 } else { 0.0 })
-        })
-        .unwrap();
-        assert_eq!(gains.len(), mix.len());
-        assert!(
-            gains[..half - RATE as usize / 2]
-                .iter()
-                .all(|&g| (g - 1.0).abs() < 1e-6)
-        );
-        assert!(
-            gains[half + RATE as usize / 2..]
-                .iter()
-                .all(|&g| g == MUTE_GAIN)
-        );
-        // The change is a short fade, never a jump.
-        assert!(gains.windows(2).all(|p| (p[0] - p[1]).abs() < 0.01));
-        // Near silence isn't checked, so nothing is turned down.
-        let quiet = vec![0.0001f32; 2 * RATE as usize];
-        let gains = match_gains(&quiet, |_| -> Result<f32, String> { panic!("checked") }).unwrap();
-        assert!(gains.iter().all(|&g| (g - 1.0).abs() < 1e-6));
-        // A block shorter than one window is checked as a whole.
-        let short = vec![0.1f32; RATE as usize / 2];
-        assert!(
-            match_gains(&short, |_| Ok(0.0))
-                .unwrap()
-                .iter()
-                .all(|&g| g == MUTE_GAIN)
-        );
+        assert_eq!(local_options("[noise]\nthreads = 4\n"), (0.0, 2));
     }
 
     #[test]
@@ -1125,31 +774,21 @@ mod tests {
     }
 
     #[test]
-    fn blocks_carry_a_second_of_context() {
+    fn blocks_follow_one_another() {
         let mut b = Blocks::default();
         let chunk = |v: i16| vec![v; CHUNK];
-        // 2 s of chunks make the first block, with no context yet.
+        // 2 s of chunks make a block, then the next starts afresh.
         for i in 0..19 {
             assert!(b.push(&chunk(i)).is_none());
         }
-        let (context, block) = b.push(&chunk(19)).unwrap();
-        assert_eq!((context.len(), block.len()), (0, BLOCK));
-        // The next block's context is the last second of the first.
-        for i in 20..39 {
-            assert!(b.push(&chunk(i)).is_none());
-        }
-        let (context, block) = b.push(&chunk(39)).unwrap();
+        let block = b.push(&chunk(19)).unwrap();
         assert_eq!(
-            (context.len(), context[0], *context.last().unwrap()),
-            (CONTEXT, 10, 19)
+            (block.len(), block[0], *block.last().unwrap()),
+            (BLOCK, 0, 19)
         );
-        assert_eq!((block[0], *block.last().unwrap()), (20, 39));
-        // Audio that went on uncleaned still counts as context.
-        b.push(&chunk(40));
-        assert_eq!(b.flush(), chunk(40));
-        b.remember(&chunk(41));
-        assert_eq!(*b.recent.back().unwrap(), 41);
-        assert_eq!(b.recent.len(), CONTEXT);
+        assert!(b.push(&chunk(20)).is_none());
+        assert_eq!(b.flush(), chunk(20));
+        assert!(b.flush().is_empty());
     }
 
     /// A stand-in server: answers each request with the next canned reply,
@@ -1230,10 +869,9 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// WeSep on this PC through `clean()`, as during a transcribed call: a
-    /// recording (repeated to 30 s, real-time paced, so the lag limit and the
-    /// speech-only rule are at work) goes in as 100 ms chunks, and what comes
-    /// out is checked and written. The voice sample must already be at
+    /// WeSep then speech enhancement on this PC through `clean()`, as during
+    /// a transcribed call: a recording (repeated to 30 s, real-time paced)
+    /// goes in as 100 ms chunks, and what comes out is checked and written. The voice sample must already be at
     /// `sample_path()`. Set YAL_TSE_TEST to "<dir with onnxruntime.dll and
     /// wesep\\>|<noisy recording.wav>|<output.wav>".
     /// cargo test --release cleans_on_this_pc -- --ignored --nocapture
@@ -1267,7 +905,6 @@ mod tests {
             files,
             remix: 0.0,
             threads: 2,
-            mute: true,
             enhance: (dfn3(), crate::denoise::DEFAULT_ATTENUATION_DB),
         };
         transcribe::enable();
@@ -1314,24 +951,21 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("models/DeepFilterNet3_onnx.tar.gz")
     }
 
-    /// The team's configuration on this PC, chunk by chunk as during a call
-    /// (every chunk cleaned, no pacing), on a recording: WeSep in 3 s chunks
-    /// overlapping by 1 s, then speech enhancement. Reports how long each
-    /// chunk took and writes the result. Set YAL_MUTE_TEST to "<dir with
-    /// onnxruntime.dll and wesep\\>|<voice sample.wav>|<noisy
-    /// recording.wav>|<output.wav>" (16 kHz mono WAV); YAL_MUTE_ONLY too for
-    /// the voice-match mute in WeSep's place.
-    /// cargo test --release mutes_on_this_pc -- --ignored --nocapture
+    /// The team's configuration on this PC, block by block as during a call
+    /// (no pacing), on a recording: WeSep on every 2 s block, then speech
+    /// enhancement. Reports how long each block took and writes the result.
+    /// Set YAL_CLEAN_TEST to "<dir with onnxruntime.dll and wesep\\>|<voice
+    /// sample.wav>|<noisy recording.wav>|<output.wav>" (16 kHz mono WAV).
+    /// cargo test --release extracts_then_enhances -- --ignored --nocapture
     #[test]
     #[ignore = "needs the WeSep files and test recordings"]
-    fn mutes_on_this_pc() {
-        let spec = std::env::var("YAL_MUTE_TEST").expect("set YAL_MUTE_TEST");
+    fn extracts_then_enhances() {
+        let spec = std::env::var("YAL_CLEAN_TEST").expect("set YAL_CLEAN_TEST");
         let [dir, sample, input, output] = spec.split('|').collect::<Vec<_>>()[..] else {
-            panic!("YAL_MUTE_TEST needs 4 parts");
+            panic!("YAL_CLEAN_TEST needs 4 parts");
         };
         let files = tse::Files::find(Path::new(dir)).expect("WeSep files");
-        let separate = std::env::var_os("YAL_MUTE_ONLY").is_none();
-        let mut local = Local::new(&files, 0.0, 2, true, PathBuf::from(sample));
+        let mut local = Local::new(&files, 0.0, 2, PathBuf::from(sample));
         let attenuation = crate::denoise::DEFAULT_ATTENUATION_DB;
         let mut enhancer = Enhancer::new(&dfn3(), attenuation).unwrap();
         let b = fs::read(input).unwrap();
@@ -1341,22 +975,16 @@ mod tests {
             .iter()
             .map(|&c| i16::from_le_bytes(c))
             .collect();
-        let (mut blocks, mut joiner, mut cleaned) =
-            (Blocks::default(), Joiner::default(), Vec::new());
+        let (mut blocks, mut cleaned) = (Blocks::default(), Vec::new());
         for chunk in audio.chunks(CHUNK) {
-            if let Some((context, block)) = blocks.push(chunk) {
+            if let Some(block) = blocks.push(chunk) {
                 let t = Instant::now();
-                let c = local.extract(&context, &block, separate).unwrap();
-                cleaned.extend(enhancer.process(&joiner.push(&c, context.len())));
-                println!(
-                    "chunk {:.2} s (2 threads, {})",
-                    t.elapsed().as_secs_f32(),
-                    if separate { "WeSep" } else { "mute" }
-                );
+                let c = local.extract(&block).unwrap();
+                cleaned.extend(enhancer.process(&c));
+                println!("block {:.2} s (2 threads)", t.elapsed().as_secs_f32());
             }
         }
-        let rest = [joiner.flush(), blocks.flush()].concat();
-        cleaned.extend(enhancer.process(&rest));
+        cleaned.extend(enhancer.process(&blocks.flush()));
         // Speech enhancement works in 10 ms frames: silence after the end
         // brings out the last part of one.
         cleaned.extend(enhancer.process(&[0; CHUNK]));
@@ -1395,13 +1023,12 @@ mod tests {
         let mut client = Client::new(settings, PathBuf::from(sample));
         let (mut blocks, mut cleaned) = (Blocks::default(), Vec::new());
         for chunk in audio.chunks(CHUNK) {
-            if let Some((context, block)) = blocks.push(chunk) {
+            if let Some(block) = blocks.push(chunk) {
                 let t = Instant::now();
-                let out = client.extract(&context, &block).unwrap();
+                let out = client.extract(&[], &block).unwrap();
                 println!(
-                    "block of {:.1} s (+{:.1} s context): {} ms",
+                    "block of {:.1} s: {} ms",
                     block.len() as f32 / RATE as f32,
-                    context.len() as f32 / RATE as f32,
                     t.elapsed().as_millis()
                 );
                 assert_eq!(out.len(), block.len());

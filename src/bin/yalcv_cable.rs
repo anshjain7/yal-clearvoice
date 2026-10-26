@@ -215,12 +215,11 @@ fn main() {
     let voice_backend = match voice::Settings::parse(&ini) {
         Some(server) => Some(voice::Backend::Server(server)),
         None => tse::Files::find(&exe_dir).map(|files| {
-            let (remix, threads, mute) = voice::local_options(&ini);
+            let (remix, threads) = voice::local_options(&ini);
             voice::Backend::Local {
                 files,
                 remix,
                 threads,
-                mute,
                 enhance: (beside_exe("DeepFilterNet3_onnx.tar.gz"), attenuation),
             }
         }),
