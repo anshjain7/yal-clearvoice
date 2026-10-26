@@ -12,6 +12,6 @@ pub mod ring;
 pub mod stream;
 pub mod transcribe;
 pub mod tse;
-pub mod voice;
 pub mod vmic;
+pub mod voice;
 pub mod vspk;

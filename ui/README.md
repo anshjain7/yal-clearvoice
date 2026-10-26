@@ -82,6 +82,7 @@ attenuation_db = 15    ; 6..100 dB; 100 = all it can (sounds muffled with a
 [voice]                ; optional
 remix = 0.2            ; how much of the original is mixed back in
 threads = 2            ; for WeSep on this PC (1-8)
+mute_others = on       ; voice-match mute on this PC; off to turn it off
 url = http://<server>:8090   ; only to use a voice server instead
 api_key = <key>
 ```
@@ -92,7 +93,10 @@ the transcript then goes through WeSep speaker extraction first: on the PC
 server when `[voice] url` is set (see `voice-server/README.md`). On the PC it
 runs below normal priority, cleans only stretches with speech, and lets audio
 through uncleaned whenever it falls more than 4 s behind, so call audio is
-never affected.
+never affected. After WeSep, a voice-match mute checks each stretch against
+the voice sample, a second at a time, and turns down by 30 dB whatever doesn't
+sound like the agent, such as a colleague talking while the agent is silent
+(WeSep alone lets that through).
 
 ## Protocol (the pipe contract)
 
