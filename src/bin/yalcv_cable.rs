@@ -91,6 +91,17 @@ fn choose_mic(requested: Option<&str>) -> Option<String> {
     choose_real(Direction::Input, requested).map(|d| d.id)
 }
 
+/// The microphone the engine is recording now (its device id; empty before
+/// one opens).
+static MIC_IN_USE: Mutex<String> = Mutex::new(String::new());
+
+/// The agent's raw microphone, before noise removal: what speaker extraction
+/// on this PC transcribes from (voice.rs).
+fn mic_in_use() -> Option<String> {
+    let id = MIC_IN_USE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    (!id.is_empty()).then_some(id)
+}
+
 /// The agent's real headset or speaker: where the customer is heard.
 fn agent_speaker() -> Option<String> {
     choose_real(Direction::Output, None).map(|d| d.id)
@@ -210,6 +221,7 @@ fn main() {
                 remix,
                 threads,
                 mute,
+                enhance: (beside_exe("DeepFilterNet3_onnx.tar.gz"), attenuation),
             }
         }),
     };
@@ -224,7 +236,6 @@ fn main() {
     }
 
     let requested_mic: Mutex<Option<String>> = Mutex::new(None);
-    let mic_in_use = Mutex::new(String::new());
     let mic_reopen = AtomicBool::new(false);
     // 160 ms each: room for noise removal to catch up after a stall without
     // the microphone dropping frames, and for the send path's cushion.
@@ -270,7 +281,7 @@ fn main() {
                     let m = Mic::open(Some(id.as_str()))?;
                     TELEMETRY.mic_connected.store(true, Relaxed);
                     TELEMETRY.set_mic_name(&m.device.name);
-                    *mic_in_use.lock().unwrap() = id;
+                    *MIC_IN_USE.lock().unwrap_or_else(|e| e.into_inner()) = id;
                     Ok(m)
                 },
                 |m| {
@@ -282,15 +293,27 @@ fn main() {
                 },
             )
         });
-        // Both sides of the call, each recorded by loopback and relayed to Sarvam:
-        // the customer from the agent's headset, the agent from VB-CABLE (their
+        // Both sides of the call, each recorded and relayed to Sarvam: the
+        // customer by loopback of the agent's headset; the agent from their raw
+        // microphone when WeSep runs on this PC (extraction, then speech
+        // enhancement, in voice.rs), else by loopback of VB-CABLE (their
         // cleaned voice). Off the audio path: nothing here touches the rings.
         if let Some(settings) = &transcription {
             let listen_stop = &listen_stop;
             let customer = agent_speaker as fn() -> Option<String>;
-            for (side, endpoint) in [(Side::Customer, customer), (Side::Agent, cable_input)] {
+            let agent = match &voice_backend {
+                Some(voice::Backend::Local { .. }) => {
+                    (Direction::Input, mic_in_use as fn() -> Option<String>)
+                }
+                _ => (Direction::Output, cable_input as fn() -> Option<String>),
+            };
+            let sides = [
+                (Side::Customer, (Direction::Output, customer)),
+                (Side::Agent, agent),
+            ];
+            for (side, (direction, endpoint)) in sides {
                 let (tx, rx) = mpsc::channel();
-                s.spawn(move || transcribe::listen(endpoint, tx, listen_stop));
+                s.spawn(move || transcribe::listen(direction, endpoint, tx, listen_stop));
                 // Only the agent's own voice, when there's a voice server.
                 let rx = match (&voice_backend, side) {
                     (Some(backend), Side::Agent) => {
@@ -366,8 +389,9 @@ fn main() {
                 TELEMETRY.notice.store(notice, Relaxed);
                 if TELEMETRY.mic_connected.load(Relaxed)
                     && requested_mic.lock().unwrap().is_none()
-                    && choose_mic(None)
-                        .is_some_and(|id| !id.eq_ignore_ascii_case(&mic_in_use.lock().unwrap()))
+                    && choose_mic(None).is_some_and(|id| {
+                        !id.eq_ignore_ascii_case(&mic_in_use().unwrap_or_default())
+                    })
                 {
                     mic_reopen.store(true, Relaxed);
                 }
