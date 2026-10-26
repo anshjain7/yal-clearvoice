@@ -21,7 +21,10 @@
 //! a colleague who talks while the agent is silent. So on this PC each block
 //! also goes through a voice-match mute: it's checked against the voice
 //! sample a second at a time, and the parts that don't sound like the agent
-//! are turned down (`[voice] mute_others`, on by default).
+//! are turned down (`[voice] mute_others`, on by default). The mute costs
+//! about a tenth of WeSep, so when the PC can't keep up with WeSep (most
+//! 15 W office laptops) blocks get the mute alone: that still keeps out a
+//! colleague talking in turn with the agent, though not one talking over them.
 //!
 //! The voice sample is 20 s of the agent speaking, recorded once from the
 //! cleaned voice (the same sound extraction later works on) and kept in
@@ -54,9 +57,13 @@ const BLOCK_TIME: Duration = Duration::from_secs(2);
 /// noise removal the agent's side is nearly silent between words, so they
 /// hold no voices worth removing, and skipping them about halves the work.
 const MIN_SPEECH: usize = 3;
-/// How far behind the call extraction may fall (a slow PC) before blocks go
+/// How far behind the call cleaning may fall (a slow PC) before blocks go
 /// on uncleaned until it has caught up, so the transcript never lags more.
 const MAX_BEHIND: Duration = Duration::from_secs(4);
+/// After WeSep takes longer than a block to clean one (the PC can't keep up
+/// with it), blocks get only the voice-match mute for this long, so a slow
+/// PC isn't kept busy with WeSep it can't finish in time.
+const WESEP_REST: Duration = Duration::from_secs(60);
 /// How long the voice sample is.
 pub const SAMPLE_SECONDS: usize = 20;
 /// Speech the sample must hold to be any use: 6 s.
@@ -265,8 +272,7 @@ pub fn clean(backend: &Backend, input: Receiver<Vec<i16>>, out: Sender<Vec<i16>>
     };
     let mut blocks = Blocks::default();
     let mut off_until: Option<Instant> = None;
-    // How far behind the call extraction has fallen.
-    let mut behind = Duration::ZERO;
+    let mut pacer = Pacer::default();
     // While the call is also being recorded: its cleaned voice, saved next to it.
     let mut saver = Saver::default();
     for chunk in input {
@@ -289,13 +295,14 @@ pub fn clean(backend: &Backend, input: Receiver<Vec<i16>>, out: Sender<Vec<i16>>
             .chunks(CHUNK)
             .filter(|c| transcribe::is_speech(c))
             .count();
-        let cleaned = if speech < MIN_SPEECH || behind > MAX_BEHIND {
-            behind = behind.saturating_sub(BLOCK_TIME);
+        let step = pacer.step(speech, Instant::now());
+        let cleaned = if step == Step::Raw {
+            pacer.done(step, Duration::ZERO, Instant::now());
             block
         } else {
             let started = Instant::now();
-            let result = engine.extract(&context, &block);
-            behind = (behind + started.elapsed()).saturating_sub(BLOCK_TIME);
+            let result = engine.extract(&context, &block, step == Step::Full);
+            pacer.done(step, started.elapsed(), Instant::now());
             match result {
                 Ok(cleaned) => {
                     set_state(ipc::VOICE_READY);
@@ -315,6 +322,48 @@ pub fn clean(backend: &Backend, input: Receiver<Vec<i16>>, out: Sender<Vec<i16>>
         }
     }
     saver.save(false, None, &[]);
+}
+
+/// What happens to one block.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Step {
+    /// Goes on as it is.
+    Raw,
+    /// The voice-match mute alone.
+    MuteOnly,
+    /// WeSep, then the mute.
+    Full,
+}
+
+/// Picks each block's step from how well the PC is keeping up: WeSep only
+/// while it can clean a block in less time than the block lasts, else the
+/// mute alone, and nothing while even that has fallen too far behind.
+#[derive(Default)]
+struct Pacer {
+    /// How far behind the call cleaning has fallen.
+    behind: Duration,
+    /// WeSep is left out until then, after a block it couldn't clean in time.
+    wesep_rest: Option<Instant>,
+}
+
+impl Pacer {
+    fn step(&self, speech: usize, now: Instant) -> Step {
+        if speech < MIN_SPEECH || self.behind > MAX_BEHIND {
+            Step::Raw
+        } else if self.behind > BLOCK_TIME || self.wesep_rest.is_some_and(|t| now < t) {
+            Step::MuteOnly
+        } else {
+            Step::Full
+        }
+    }
+
+    /// Notes a block's step and how long it took.
+    fn done(&mut self, step: Step, took: Duration, now: Instant) {
+        self.behind = (self.behind + took).saturating_sub(BLOCK_TIME);
+        if step == Step::Full && took > BLOCK_TIME {
+            self.wesep_rest = Some(now + WESEP_REST);
+        }
+    }
 }
 
 /// Saves what goes on to the transcript, the agent's cleaned voice, while a
@@ -398,10 +447,18 @@ impl Engine {
         }
     }
 
-    fn extract(&mut self, context: &[i16], block: &[i16]) -> Result<Vec<i16>, String> {
+    /// The cleaned block: WeSep then the mute when `separate`, else the mute
+    /// alone (which the server doesn't do: its blocks then go on as they are).
+    fn extract(
+        &mut self,
+        context: &[i16],
+        block: &[i16],
+        separate: bool,
+    ) -> Result<Vec<i16>, String> {
         match self {
-            Engine::Server(c) => c.extract(context, block),
-            Engine::Local(l) => l.extract(context, block),
+            Engine::Server(c) if separate => c.extract(context, block),
+            Engine::Server(_) => Ok(block.to_vec()),
+            Engine::Local(l) => l.extract(context, block, separate),
         }
     }
 
@@ -456,7 +513,16 @@ impl Local {
         Ok(self.model.as_mut().expect("just loaded"))
     }
 
-    fn extract(&mut self, context: &[i16], block: &[i16]) -> Result<Vec<i16>, String> {
+    /// WeSep (when `separate`) and the mute (when on) on `block`.
+    fn extract(
+        &mut self,
+        context: &[i16],
+        block: &[i16],
+        separate: bool,
+    ) -> Result<Vec<i16>, String> {
+        if !separate && !self.mute {
+            return Ok(block.to_vec());
+        }
         let modified = fs::metadata(&self.sample)
             .and_then(|m| m.modified())
             .map_err(|e| e.to_string())?;
@@ -478,8 +544,12 @@ impl Local {
             .chain(block)
             .map(|&s| f32::from(s) / 32768.0)
             .collect();
-        let est = model.extract(embedding, &mix)?;
-        let mut out = tse::remix(&est, &mix, self.remix);
+        let mut out = if separate {
+            let est = model.extract(embedding, &mix)?;
+            tse::remix(&est, &mix, self.remix)
+        } else {
+            mix.clone()
+        };
         if self.mute {
             let gains = match_gains(&mix, |w| Ok(tse::similarity(&model.enroll(w)?, embedding)))?;
             out.iter_mut().zip(gains).for_each(|(v, g)| *v *= g);
@@ -833,6 +903,38 @@ mod tests {
     }
 
     #[test]
+    fn pacer_drops_wesep_when_the_pc_cant_keep_up() {
+        let t0 = Instant::now();
+        let secs = Duration::from_secs_f32;
+        let mut p = Pacer::default();
+        // Little speech: nothing to clean.
+        assert_eq!(p.step(MIN_SPEECH - 1, t0), Step::Raw);
+        // A fast PC: WeSep every time.
+        for _ in 0..5 {
+            assert_eq!(p.step(10, t0), Step::Full);
+            p.done(Step::Full, secs(1.5), t0);
+        }
+        // WeSep took longer than the block: the mute alone, for WESEP_REST.
+        p.done(Step::Full, secs(2.5), t0);
+        assert_eq!(p.step(10, t0), Step::MuteOnly);
+        p.done(Step::MuteOnly, secs(0.2), t0);
+        assert_eq!(p.behind, Duration::ZERO);
+        assert_eq!(p.step(10, t0 + WESEP_REST / 2), Step::MuteOnly);
+        // Then WeSep is tried again.
+        assert_eq!(p.step(10, t0 + WESEP_REST), Step::Full);
+        // Far behind (a busy PC): the mute alone, then nothing until caught up.
+        let mut p = Pacer::default();
+        p.done(Step::MuteOnly, secs(5.0), t0);
+        assert_eq!(p.step(10, t0), Step::MuteOnly);
+        p.done(Step::MuteOnly, secs(4.0), t0);
+        assert_eq!(p.step(10, t0), Step::Raw);
+        p.done(Step::Raw, Duration::ZERO, t0);
+        assert_eq!(p.step(10, t0), Step::MuteOnly);
+        p.done(Step::Raw, Duration::ZERO, t0);
+        assert_eq!(p.step(10, t0), Step::Full);
+    }
+
+    #[test]
     fn mute_keeps_the_agent_and_turns_others_down() {
         // 4 s at a steady level: the agent in the first 2 s, someone else
         // after (the score function plays the voice matcher).
@@ -1104,7 +1206,7 @@ mod tests {
     /// long each block took and writes the result. Set YAL_MUTE_TEST to
     /// "<dir with onnxruntime.dll and wesep\\>|<voice sample.wav>|<noisy
     /// recording.wav>|<output.wav>" (16 kHz mono WAV); YAL_MUTE_OFF too to
-    /// time it without the mute.
+    /// time it without the mute, or YAL_MUTE_ONLY without WeSep.
     /// cargo test --release mutes_on_this_pc -- --ignored --nocapture
     #[test]
     #[ignore = "needs the WeSep files and test recordings"]
@@ -1115,6 +1217,7 @@ mod tests {
         };
         let files = tse::Files::find(Path::new(dir)).expect("WeSep files");
         let mute = std::env::var_os("YAL_MUTE_OFF").is_none();
+        let separate = std::env::var_os("YAL_MUTE_ONLY").is_none();
         let mut local = Local::new(&files, 0.2, 2, mute, PathBuf::from(sample));
         let b = fs::read(input).unwrap();
         let audio: Vec<i16> = b[44..]
@@ -1127,9 +1230,9 @@ mod tests {
         for chunk in audio.chunks(CHUNK) {
             if let Some((context, block)) = blocks.push(chunk) {
                 let t = Instant::now();
-                cleaned.extend(local.extract(&context, &block).unwrap());
+                cleaned.extend(local.extract(&context, &block, separate).unwrap());
                 println!(
-                    "block {:.2} s (2 threads, mute {mute})",
+                    "block {:.2} s (2 threads, WeSep {separate}, mute {mute})",
                     t.elapsed().as_secs_f32()
                 );
             }
