@@ -90,11 +90,15 @@ pub(crate) fn recording() -> Option<PathBuf> {
     RECORDING.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// Where the agent's cleaned voice goes for the recording `wav`:
-/// `2026-10-14 10-32-05.wav` -> `2026-10-14 10-32-05 cleaned voice.wav`.
-pub(crate) fn cleaned_path(wav: &Path) -> PathBuf {
+/// Where the agent's own voice goes for the recording `wav`, in an "Agent
+/// voice" folder beside it: before the models (the raw microphone) and after
+/// them (speaker extraction and speech enhancement, what the transcript
+/// gets). `Recordings\2026-10-14 10-32-05.wav` ->
+/// `Recordings\Agent voice\2026-10-14 10-32-05 noisy.wav`, `... cleaned.wav`.
+pub(crate) fn agent_voice_path(wav: &Path, which: &str) -> PathBuf {
     let stem = wav.file_stem().unwrap_or_default().to_string_lossy();
-    wav.with_file_name(format!("{stem} cleaned voice.wav"))
+    wav.with_file_name("Agent voice")
+        .join(format!("{stem} {which}.wav"))
 }
 
 /// A side to record: its name, and the device it comes from, if found.
@@ -505,10 +509,15 @@ mod tests {
     }
 
     #[test]
-    fn cleaned_voice_sits_next_to_its_recording() {
+    fn agent_voice_goes_in_its_own_folder() {
+        let wav = Path::new(r"C:\Rec\2026-10-14 10-32-05.wav");
         assert_eq!(
-            cleaned_path(Path::new(r"C:\Rec\2026-10-14 10-32-05.wav")),
-            Path::new(r"C:\Rec\2026-10-14 10-32-05 cleaned voice.wav")
+            agent_voice_path(wav, "noisy"),
+            Path::new(r"C:\Rec\Agent voice\2026-10-14 10-32-05 noisy.wav")
+        );
+        assert_eq!(
+            agent_voice_path(wav, "cleaned"),
+            Path::new(r"C:\Rec\Agent voice\2026-10-14 10-32-05 cleaned.wav")
         );
     }
 

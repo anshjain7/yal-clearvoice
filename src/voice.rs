@@ -242,8 +242,13 @@ pub fn clean(backend: &Backend, input: Receiver<Vec<i16>>, out: Sender<Vec<i16>>
     };
     let mut blocks = Blocks::default();
     let mut off_until: Option<Instant> = None;
-    // While the call is also being recorded: its cleaned voice, saved next to it.
-    let mut saver = Saver::default();
+    // While the call is also being recorded: the agent's voice before and
+    // after the models, saved beside it. Before only on this PC, where the
+    // input is the raw microphone (a server gets the call's cleaned voice).
+    let mut savers = Savers {
+        noisy: matches!(engine, Engine::Local(_)).then(|| Saver::new("noisy")),
+        cleaned: Saver::new("cleaned"),
+    };
     for chunk in input {
         let calling = transcribe::active();
         let on =
@@ -252,11 +257,10 @@ pub fn clean(backend: &Backend, input: Receiver<Vec<i16>>, out: Sender<Vec<i16>>
             // Audio held for a block that won't be cleaned goes on as it is.
             let mut audio = blocks.flush();
             audio.extend(&chunk);
-            let registered = engine.sample().is_file();
             // Speech enhancement only during a call: between calls nothing is
             // transcribed, and it would keep a core busy for nothing.
             let enhance = enhancer.as_mut().filter(|_| calling);
-            send(&audio, enhance, registered, &mut saver, &out);
+            send(&audio, &audio, enhance, &mut savers, &out);
             continue;
         }
         let Some(block) = blocks.push(&chunk) else {
@@ -271,54 +275,78 @@ pub fn clean(backend: &Backend, input: Receiver<Vec<i16>>, out: Sender<Vec<i16>>
             Err(_) => {
                 set_state(engine.failed_state());
                 off_until = Some(Instant::now() + OFF_AFTER_FAILURE);
-                block
+                block.clone()
             }
         };
-        send(&cleaned, enhancer.as_mut(), true, &mut saver, &out);
+        send(&block, &cleaned, enhancer.as_mut(), &mut savers, &out);
     }
-    send(&blocks.flush(), enhancer.as_mut(), true, &mut saver, &out);
-    saver.save(false, None, &[]);
+    let rest = blocks.flush();
+    send(&rest, &rest, enhancer.as_mut(), &mut savers, &out);
+    if let Some(noisy) = &mut savers.noisy {
+        noisy.save(None, &[]);
+    }
+    savers.cleaned.save(None, &[]);
 }
 
 /// Hands cleaned audio on: through speech enhancement (`enhancer`, when
-/// there is one), to the call's cleaned-voice file, then to the relay.
+/// there is one), to the relay. While a call is being recorded, `raw` (what
+/// the models got) and the result go to the agent's voice files.
 fn send(
-    audio: &[i16],
+    raw: &[i16],
+    cleaned: &[i16],
     enhancer: Option<&mut Enhancer>,
-    registered: bool,
-    saver: &mut Saver,
+    savers: &mut Savers,
     out: &Sender<Vec<i16>>,
 ) {
     let audio = match enhancer {
-        Some(e) => e.process(audio),
-        None => audio.to_vec(),
+        Some(e) => e.process(cleaned),
+        None => cleaned.to_vec(),
     };
+    let recording = record::recording();
+    if let Some(noisy) = &mut savers.noisy {
+        noisy.save(recording.clone(), raw);
+    }
     for c in audio.chunks(CHUNK) {
-        saver.save(registered, record::recording(), c);
+        savers.cleaned.save(recording.clone(), c);
         let _ = out.send(c.to_vec());
     }
 }
 
-/// Saves what goes on to the transcript, the agent's cleaned voice, while a
-/// call is being recorded: `<recording> cleaned voice.wav`, next to the call
-/// recording, like run_tse.sh's --output. Only with a registered voice.
-#[derive(Default)]
+/// The agent's voice files for the call being recorded.
+struct Savers {
+    /// Before the models; None when the input isn't the raw microphone.
+    noisy: Option<Saver>,
+    /// After them: what the transcript gets (run_tse.sh then run_se.sh's
+    /// output).
+    cleaned: Saver,
+}
+
+/// Saves one of the agent's voice files while a call is being recorded:
+/// `Agent voice\<recording> <which>.wav`, beside the call recording.
 struct Saver {
+    which: &'static str,
     file: Option<(PathBuf, record::Wav)>,
 }
 
 impl Saver {
+    fn new(which: &'static str) -> Saver {
+        Saver { which, file: None }
+    }
+
     /// Adds `audio` for the recording `recording` (None: no call being
     /// recorded), starting or finishing files as recordings come and go.
-    fn save(&mut self, registered: bool, recording: Option<PathBuf>, audio: &[i16]) {
-        let want = recording
-            .filter(|_| registered)
-            .map(|r| record::cleaned_path(&r));
+    fn save(&mut self, recording: Option<PathBuf>, audio: &[i16]) {
+        let want = recording.map(|r| record::agent_voice_path(&r, self.which));
         if self.file.as_ref().map(|(p, _)| p) != want.as_ref() {
             if let Some((_, mut wav)) = self.file.take() {
                 let _ = wav.patch();
             }
-            self.file = want.and_then(|p| record::Wav::create(&p).ok().map(|w| (p, w)));
+            self.file = want.and_then(|p| {
+                if let Some(dir) = p.parent() {
+                    fs::create_dir_all(dir).ok()?;
+                }
+                record::Wav::create(&p).ok().map(|w| (p, w))
+            });
         }
         if let Some((_, wav)) = &mut self.file
             && wav.write(audio).is_err()
@@ -702,15 +730,20 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("clearvoice-saver-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let (a, b) = (dir.join("a.wav"), dir.join("b.wav"));
-        let mut s = Saver::default();
-        s.save(true, Some(a.clone()), &[1, 2, 3]);
-        s.save(true, Some(a.clone()), &[4]);
-        s.save(false, Some(b.clone()), &[5]); // not registered: nothing
-        s.save(true, Some(b.clone()), &[6, 7]);
-        s.save(true, None, &[8]); // the recording stopped
+        let (mut noisy, mut cleaned) = (Saver::new("noisy"), Saver::new("cleaned"));
+        noisy.save(Some(a.clone()), &[1, 2, 3]);
+        cleaned.save(Some(a.clone()), &[1, 2, 3]);
+        noisy.save(Some(a.clone()), &[4]);
+        noisy.save(None, &[5]); // no call being recorded: nothing
+        noisy.save(Some(b.clone()), &[6, 7]);
+        noisy.save(None, &[8]); // the recording stopped
         let len = |p: &Path| (fs::read(p).unwrap().len() - 44) / 2;
-        assert_eq!(len(&record::cleaned_path(&a)), 4);
-        assert_eq!(len(&record::cleaned_path(&b)), 2);
+        // Both files in the "Agent voice" folder beside the recordings.
+        let folder = dir.join("Agent voice");
+        assert_eq!(len(&folder.join("a noisy.wav")), 4);
+        assert_eq!(len(&folder.join("a cleaned.wav")), 3);
+        assert_eq!(len(&folder.join("b noisy.wav")), 2);
+        assert!(!folder.join("b cleaned.wav").exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 
