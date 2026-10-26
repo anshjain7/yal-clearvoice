@@ -61,8 +61,7 @@ pub struct Extractor {
 }
 
 impl Extractor {
-    /// Loads ONNX Runtime and both models; `threads` for each (the speaker
-    /// model runs on every block too, for voice.rs's voice-match mute).
+    /// Loads ONNX Runtime and both models; `threads` for each.
     /// Slow (a second or two): call it off the audio threads.
     pub fn load(files: &Files, threads: usize) -> Result<Extractor, String> {
         let env = ort::init_from(&files.runtime)
@@ -127,14 +126,6 @@ impl Extractor {
             .map_err(|e| e.to_string())?;
         Ok(istft(&self.ifft, r, i, frames, mix.len()))
     }
-}
-
-/// How alike two speaker embeddings are (cosine similarity, -1..1): the same
-/// speaker scores well above different ones.
-pub fn similarity(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    dot / (norm(a) * norm(b)).max(f32::EPSILON)
 }
 
 /// run_tse.sh's --remix: the extracted voice at the input's loudness, the
@@ -404,14 +395,6 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
         assert!(worst < 1e-4, "round trip off by {worst}");
-    }
-
-    #[test]
-    fn similarity_is_cosine() {
-        assert!((similarity(&[1.0, 2.0], &[2.0, 4.0]) - 1.0).abs() < 1e-6);
-        assert!(similarity(&[1.0, 0.0], &[0.0, 3.0]).abs() < 1e-6);
-        assert!((similarity(&[1.0, 1.0], &[-1.0, -1.0]) + 1.0).abs() < 1e-6);
-        assert_eq!(similarity(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
     }
 
     #[test]
