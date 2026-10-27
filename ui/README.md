@@ -72,6 +72,7 @@ transcript pane says transcription is off and no audio leaves the PC.
 [transcription]
 api_key = <Sarvam key>
 language = auto        ; or en-IN, hi-IN, ...
+after_call = on         ; off: no after-call pass (see below)
 [summary]
 url = http://<server>/v1/chat/completions
 model = <model name>
@@ -114,6 +115,19 @@ live chain, each covering the same stretch, in a folder per call,
   transcript get;
 - `rtf.csv`: each step's real-time factor (time it took / length of the
   audio; under 1 keeps up), for every 2 s and for the whole call.
+
+After a recorded call, an after-call pass works on the agent's side the
+way the team's offline setup does, where nothing is waiting: WeSep on the
+call's `input`, 10 s at a time, then DeepFilterNet3, saved beside the
+stages as `after_call_tse.m4a` and `after_call_tse_se.m4a` (their
+real-time factors go in `rtf.csv`, what happened in `after_call.log`). The
+cleaned voice, cut into utterances, then goes to Sarvam's batch service,
+and the agent's new lines, merged in time with the customer's from the live
+transcript, make the call's improved transcript. The window summarizes it
+again: the improved summary replaces the call's note and saved copy (and
+the window's view, if it still shows that call). The first summary, from
+the live transcript, comes at Stop as before. `[transcription] after_call =
+off` turns the pass off (it sends the agent's side to Sarvam a second time).
 
 The live stage hands a copy of every 10 ms it sends out to a separate
 thread below normal priority, without waiting; if that thread falls behind,

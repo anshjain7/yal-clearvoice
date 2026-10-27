@@ -15,6 +15,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use clearvoice::aftercall;
 use clearvoice::capture::Mic;
 use clearvoice::denoise::{self, Control, DeepFilter};
 use clearvoice::devices::{self, Device, Direction, SelectError};
@@ -226,6 +227,22 @@ fn main() {
         }),
     };
     voice::set_state(voice::initial_state(voice_backend.is_some()));
+    // After a recorded call: WeSep and speech enhancement on the whole of the
+    // agent's side, then an improved transcript through Sarvam (aftercall.rs),
+    // unless settings.ini turns it off.
+    if let Some(files) = tse::Files::find(&exe_dir)
+        && aftercall::enabled(&ini)
+    {
+        let (_, threads) = voice::local_options(&ini);
+        aftercall::configure(aftercall::Config {
+            files,
+            threads,
+            sample: voice::sample_path(),
+            dfn3: beside_exe("DeepFilterNet3_onnx.tar.gz"),
+            attenuation,
+            sarvam: transcription.clone(),
+        });
+    }
 
     if !headless {
         println!("YAL ClearVoice is running.");

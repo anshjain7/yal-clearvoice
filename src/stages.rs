@@ -16,12 +16,13 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Duration;
 use std::{fs, thread};
 
+use crate::aftercall;
 use crate::audiofile;
 use crate::denoise::Control;
 use crate::enhance::Fir;
 use crate::record;
 use crate::ring::Consumer;
-use crate::transcribe::RATE;
+use crate::transcribe::{self, RATE};
 use crate::voice;
 
 /// Audio saved at a time: 2 s at 16 kHz.
@@ -233,8 +234,12 @@ impl Dump {
             let _ = w.patch();
         }
         drop(s.wavs);
-        let dir = s.dir;
-        Some(std::thread::spawn(move || to_m4a(&dir)))
+        let (dir, call) = (s.dir, transcribe::finished());
+        Some(std::thread::spawn(move || {
+            voice::below_normal_priority();
+            aftercall::run(&dir, call);
+            to_m4a(&dir);
+        }))
     }
 }
 
@@ -265,12 +270,17 @@ impl Stages {
     }
 }
 
-/// Makes each stage's WAV in `dir` an M4A, removing the WAV once its M4A is
-/// written. Where Windows can't encode M4A, the WAV stays.
+/// Makes each WAV in `dir` (the stages, and the after-call pass's) an M4A,
+/// removing the WAV once its M4A is written. Where Windows can't encode M4A,
+/// the WAV stays.
 fn to_m4a(dir: &Path) {
-    voice::below_normal_priority();
-    for name in STAGES {
-        let wav = dir.join(format!("{name}.wav"));
+    let wavs = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("wav")));
+    for wav in wavs {
         let Ok(bytes) = fs::read(&wav) else {
             continue;
         };
@@ -282,8 +292,13 @@ fn to_m4a(dir: &Path) {
             .iter()
             .map(|&b| i16::from_le_bytes(b))
             .collect();
-        if audiofile::write_m4a(&samples, &dir.join(format!("{name}.m4a"))).is_ok() {
+        // Written under another name and renamed once whole, so nobody opens
+        // a half-written file.
+        let (part, m4a) = (wav.with_extension("part.m4a"), wav.with_extension("m4a"));
+        if audiofile::write_m4a(&samples, &part).is_ok() && fs::rename(&part, &m4a).is_ok() {
             let _ = fs::remove_file(&wav);
+        } else {
+            let _ = fs::remove_file(&part);
         }
     }
 }

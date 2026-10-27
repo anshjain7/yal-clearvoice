@@ -387,6 +387,13 @@ pub(crate) fn write_wav(path: &Path, samples: &[i16]) -> io::Result<()> {
     wav.patch()
 }
 
+/// 16 kHz mono `samples` as a WAV file's bytes, in memory.
+pub(crate) fn wav_bytes(samples: &[i16]) -> Vec<u8> {
+    let mut b = header(samples.len() as u64).to_vec();
+    b.extend(samples.iter().flat_map(|s| s.to_le_bytes()));
+    b
+}
+
 /// A 16 kHz mono 16-bit WAV file being written. Its header is rewritten every
 /// 5 s, so a recording cut off by a crash or power cut still plays.
 pub(crate) struct Wav {

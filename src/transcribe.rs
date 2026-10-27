@@ -48,6 +48,7 @@ const BACKLOG: usize = 100;
 const RETRY: Duration = Duration::from_secs(1);
 
 /// `[transcription]` from settings.ini.
+#[derive(Clone)]
 pub struct Settings {
     pub api_key: String,
     /// Sarvam language code, or "auto" to detect it.
@@ -109,8 +110,13 @@ struct Call {
     /// Counts calls; 0 = none yet.
     id: u32,
     active: bool,
-    /// Finished sentences, in the order Sarvam finalized them.
-    lines: Vec<(Side, String)>,
+    /// Finished sentences, in the order Sarvam finalized them, with when
+    /// (seconds into the call).
+    lines: Vec<(Side, String, f64)>,
+    /// When the call started.
+    started: Option<Instant>,
+    /// A call's improved transcript, from the after-call pass (aftercall.rs).
+    improved: Option<(u32, Vec<(Side, String)>)>,
     /// What each side is saying right now, not final yet.
     live: [String; 2],
     last_speech: Option<Instant>,
@@ -125,10 +131,17 @@ impl Call {
             id: 0,
             active: false,
             lines: Vec::new(),
+            started: None,
+            improved: None,
             live: [String::new(), String::new()],
             last_speech: None,
             error: String::new(),
         }
+    }
+
+    /// Seconds into the call.
+    fn secs(&self) -> f64 {
+        self.started.map_or(0.0, |t| t.elapsed().as_secs_f64())
     }
 
     /// Starts a new call (if transcription is set up and none is on),
@@ -140,6 +153,7 @@ impl Call {
             self.lines.clear();
             self.live = Default::default();
             self.last_speech = Some(now);
+            self.started = Some(now);
         }
     }
 
@@ -165,7 +179,8 @@ impl Call {
         for side in [Side::Customer, Side::Agent] {
             let text = std::mem::take(&mut self.live[side as usize]);
             if !text.is_empty() {
-                self.lines.push((side, text));
+                let at = self.secs();
+                self.lines.push((side, text, at));
             }
         }
     }
@@ -180,7 +195,8 @@ impl Call {
         if !is_final {
             live.push_str(text);
         } else if !text.is_empty() {
-            self.lines.push((side, text.to_string()));
+            let at = self.secs();
+            self.lines.push((side, text.to_string(), at));
         }
     }
 
@@ -194,8 +210,15 @@ impl Call {
         };
         let lines: Vec<_> = self.lines[from..]
             .iter()
-            .map(|(side, text)| serde_json::json!({ "who": side.name(), "text": text }))
+            .map(|(side, text, _)| serde_json::json!({ "who": side.name(), "text": text }))
             .collect();
+        let improved = self.improved.as_ref().map(|(id, lines)| {
+            let lines: Vec<_> = lines
+                .iter()
+                .map(|(side, text)| serde_json::json!({ "who": side.name(), "text": text }))
+                .collect();
+            serde_json::json!({ "call": id, "lines": lines })
+        });
         serde_json::json!({
             "type": "transcript",
             "enabled": self.enabled,
@@ -204,6 +227,7 @@ impl Call {
             "total": self.lines.len(),
             "lines": lines,
             "live": { "customer": self.live[0], "agent": self.live[1] },
+            "improved": improved,
             "error": self.error,
         })
         .to_string()
@@ -237,6 +261,32 @@ pub fn end_call() {
 /// True while a call is being transcribed.
 pub(crate) fn active() -> bool {
     call().active
+}
+
+/// The last call once it's over: its number and the customer's lines (with
+/// seconds into the call), for the after-call pass.
+pub struct Finished {
+    pub id: u32,
+    pub customer: Vec<(f64, String)>,
+}
+
+/// The last call, if it's over.
+pub(crate) fn finished() -> Option<Finished> {
+    let c = call();
+    (!c.active && c.id > 0).then(|| Finished {
+        id: c.id,
+        customer: c
+            .lines
+            .iter()
+            .filter(|(side, ..)| *side == Side::Customer)
+            .map(|(_, text, at)| (*at, text.clone()))
+            .collect(),
+    })
+}
+
+/// Call `id`'s improved transcript, for the window to show and summarize.
+pub(crate) fn improve(id: u32, lines: Vec<(Side, String)>) {
+    call().improved = Some((id, lines));
 }
 
 /// The transcript as JSON for the window; see `Call::json`.
@@ -624,6 +674,24 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_call_gives_its_customer_lines_and_takes_an_improved_transcript() {
+        let mut c = started(Instant::now());
+        c.result(1, Side::Agent, "Hello, YAL support.", true);
+        c.result(1, Side::Customer, "My order is late.", true);
+        let json = |c: &Call| serde_json::from_str::<serde_json::Value>(&c.json(1, 0)).unwrap();
+        assert!(json(&c)["improved"].is_null());
+        c.finish();
+        c.improved = Some((1, vec![(Side::Agent, "Hello, YAL support here.".into())]));
+        let j = json(&c);
+        assert_eq!(j["improved"]["call"], 1);
+        assert_eq!(j["improved"]["lines"][0]["who"], "agent");
+        assert_eq!(
+            j["improved"]["lines"][0]["text"],
+            "Hello, YAL support here."
+        );
+    }
+
+    #[test]
     fn results_fill_lines_and_ending_keeps_unfinished_speech() {
         let mut c = started(Instant::now());
         c.result(1, Side::Customer, "I was charged", false);
@@ -633,13 +701,16 @@ mod tests {
         // A late result from another call is dropped.
         c.result(7, Side::Customer, "stale", true);
         c.finish();
+        let lines: Vec<_> = c.lines.iter().map(|(s, t, _)| (*s, t.as_str())).collect();
         assert_eq!(
-            c.lines,
-            vec![
-                (Side::Customer, "I was charged twice.".to_string()),
-                (Side::Agent, "Let me check".to_string())
+            lines,
+            [
+                (Side::Customer, "I was charged twice."),
+                (Side::Agent, "Let me check")
             ]
         );
+        // Each line has when it was finalized, in order.
+        assert!(c.lines[0].2 <= c.lines[1].2 && c.lines[1].2 < 5.0);
         // And once it's over, nothing more is added.
         c.result(1, Side::Agent, "after", true);
         assert_eq!(c.lines.len(), 2);
@@ -753,11 +824,8 @@ mod tests {
             c.error,
             c.json(0, 0)
         );
-        assert!(
-            c.lines
-                .iter()
-                .any(|(side, text)| *side == Side::Customer
-                    && text.to_lowercase().contains("refund"))
-        );
+        assert!(c.lines.iter().any(
+            |(side, text, _)| *side == Side::Customer && text.to_lowercase().contains("refund")
+        ));
     }
 }
