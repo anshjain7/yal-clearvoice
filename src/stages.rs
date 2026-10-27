@@ -7,9 +7,11 @@
 //! here as a copy, without waiting; this thread, below normal priority,
 //! brings the copies down to 16 kHz and saves them in 2 s blocks while a call
 //! is being recorded (record.rs). If it falls behind, copies are dropped,
-//! never the call's audio. Until the live chain has a TSE model, `audio_tse`
+//! never the call's audio. With live TSE on (livetse.rs), `audio_tse` is its
+//! output and the microphone comes from its own copies; otherwise `audio_tse`
 //! is the microphone as it was.
 
+use std::collections::VecDeque;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -20,6 +22,8 @@ use crate::aftercall;
 use crate::audiofile;
 use crate::denoise::Control;
 use crate::enhance::Fir;
+use crate::frame::AudioFrame;
+use crate::livetse;
 use crate::record;
 use crate::ring::Consumer;
 use crate::transcribe::{self, RATE};
@@ -30,22 +34,43 @@ const BLOCK: usize = 2 * RATE as usize;
 /// The live chain's rate over the saved files' (48 kHz to 16 kHz).
 const DOWN: usize = 3;
 
-/// Saves the live chain's copies from `tap` (stereo 48 kHz frames: the
-/// microphone, then what went out) while a call is being recorded
-/// (`recording`: record::recording, the recording under way), with the
-/// real-time factor of the live stage from `control`. Runs until `stop`.
+/// The live TSE stage, when the chain has one (livetse.rs): its copies
+/// (stereo: the microphone, lined up, then what it sent on) and its counters.
+pub struct LiveTse<'a> {
+    pub tap: &'a mut Consumer,
+    pub control: &'a livetse::Control,
+}
+
+/// Saves the live chain's copies from `tap` (stereo 48 kHz frames from the
+/// noise removal stage: what it got, lined up, then what went out) while a
+/// call is being recorded (`recording`: record::recording, the recording
+/// under way), with the real-time factor of the noise removal stage from
+/// `control`. With `live`, the live TSE stage before it supplies the
+/// microphone and its own real-time factor. Runs until `stop`.
 pub fn run(
     tap: &mut Consumer,
     control: &Control,
+    mut live: Option<LiveTse>,
     stop: &AtomicBool,
     recording: impl Fn() -> Option<PathBuf>,
 ) {
     voice::below_normal_priority();
-    let (mut down_mic, mut down_out) = (Fir::new(), Fir::new());
+    let (mut down_mic, mut down_tse, mut down_out) = (Fir::new(), Fir::new(), Fir::new());
+    let live_control = live.as_ref().map(|l| l.control);
     let mut gathered = Gathered::default();
     let mut dump = Dump::new(true);
     let mut current: Option<PathBuf> = None;
+    // The live TSE stage's copies waiting for their frame from noise removal.
+    let mut mics: VecDeque<AudioFrame> = VecDeque::new();
     while !stop.load(Relaxed) {
+        if let Some(l) = live.as_mut() {
+            while let Some(f) = l.tap.pop() {
+                mics.push_back(f);
+            }
+            while mics.len() > 512 {
+                mics.pop_front();
+            }
+        }
         let Some(frame) = tap.pop() else {
             thread::sleep(Duration::from_millis(5));
             continue;
@@ -53,8 +78,8 @@ pub fn run(
         let now = recording();
         if now != current {
             // What's gathered belongs to the recording before; finish it.
-            gathered.save(&mut dump, current.take(), control);
-            gathered = Gathered::starting(control);
+            gathered.save(&mut dump, current.take(), control, live_control);
+            gathered = Gathered::starting(control, live_control);
             if now.is_none() {
                 let _ = dump.close();
             }
@@ -63,59 +88,93 @@ pub fn run(
         if current.is_none() {
             continue;
         }
-        let (mic, out): (Vec<f32>, Vec<f32>) = frame
+        let (tse, out): (Vec<f32>, Vec<f32>) = frame
             .samples()
             .as_chunks::<2>()
             .0
             .iter()
             .map(|p| (p[0], p[1]))
             .unzip();
+        // The microphone the frame came from: the live TSE stage's copy with
+        // its number, or (without one) what noise removal got.
+        while mics.front().is_some_and(|m| m.seq < frame.seq) {
+            mics.pop_front();
+        }
+        let mic = match mics.front() {
+            Some(m) if m.seq == frame.seq => m
+                .samples()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|p| p[0])
+                .collect(),
+            _ => tse.clone(),
+        };
         gathered.mic.extend(to_i16(&down_mic.filter(&mic, DOWN)));
+        gathered.tse.extend(to_i16(&down_tse.filter(&tse, DOWN)));
         gathered.out.extend(to_i16(&down_out.filter(&out, DOWN)));
         if gathered.mic.len() >= BLOCK {
-            gathered.save(&mut dump, current.clone(), control);
-            gathered = Gathered::starting(control);
+            gathered.save(&mut dump, current.clone(), control, live_control);
+            gathered = Gathered::starting(control, live_control);
         }
     }
-    gathered.save(&mut dump, current, control);
+    gathered.save(&mut dump, current, control, live_control);
     let _ = dump.close();
 }
 
-/// One block on its way to the files, and where the live stage's counters
-/// stood when it started.
+/// One block on its way to the files, and where the live stages' counters
+/// (noise removal's, then live TSE's) stood when it started.
 #[derive(Default)]
 struct Gathered {
     mic: Vec<i16>,
+    tse: Vec<i16>,
     out: Vec<i16>,
-    handled: u64,
-    busy_us: u64,
+    se_at: (u64, u64),
+    tse_at: (u64, u64),
 }
 
 impl Gathered {
-    fn starting(control: &Control) -> Gathered {
+    fn starting(control: &Control, live: Option<&livetse::Control>) -> Gathered {
         Gathered {
-            handled: control.handled.load(Relaxed),
-            busy_us: control.busy_us.load(Relaxed),
+            se_at: (control.handled.load(Relaxed), control.busy_us.load(Relaxed)),
+            tse_at: live.map_or((0, 0), |l| {
+                (l.handled.load(Relaxed), l.busy_us.load(Relaxed))
+            }),
             ..Gathered::default()
         }
     }
 
-    /// Hands the block to `dump` for `recording`, with how long the live
-    /// stage spent on it.
-    fn save(&self, dump: &mut Dump, recording: Option<PathBuf>, control: &Control) {
+    /// Hands the block to `dump` for `recording`, with how long each live
+    /// stage spent on it (TSE only when it ran).
+    fn save(
+        &self,
+        dump: &mut Dump,
+        recording: Option<PathBuf>,
+        control: &Control,
+        live: Option<&livetse::Control>,
+    ) {
         if self.mic.is_empty() {
             return;
         }
-        let busy = control.busy_us.load(Relaxed).saturating_sub(self.busy_us);
-        let frames = control.handled.load(Relaxed).saturating_sub(self.handled);
-        let se = (frames > 0).then(|| Duration::from_micros(busy));
-        let n = self.mic.len().min(self.out.len());
-        // No TSE stage in the live chain yet: after TSE is the microphone.
+        let took = |(handled, busy): (u64, u64), at: (u64, u64)| {
+            (handled > at.0).then(|| Duration::from_micros(busy.saturating_sub(at.1)))
+        };
+        let se = took(
+            (control.handled.load(Relaxed), control.busy_us.load(Relaxed)),
+            self.se_at,
+        );
+        let tse_took = live.and_then(|l| {
+            took(
+                (l.handled.load(Relaxed), l.busy_us.load(Relaxed)),
+                self.tse_at,
+            )
+        });
+        let n = self.mic.len().min(self.tse.len()).min(self.out.len());
         dump.add(
             recording,
             &self.mic[..n],
-            &self.mic[..n],
-            None,
+            &self.tse[..n],
+            tse_took,
             &self.out[..n],
             se,
         );
@@ -345,7 +404,7 @@ mod tests {
             let (control, stop, on, call) = (&control, &stop, &on, &call);
             let tap_rx = &mut tap_rx;
             let recording = move || on.load(Relaxed).then(|| call.clone());
-            let writer = s.spawn(move || run(tap_rx, control, stop, recording));
+            let writer = s.spawn(move || run(tap_rx, control, None, stop, recording));
             for k in 0..450 {
                 // As the live stage does: each frame counted, with its time
                 // (3 ms of its 10), then copied.

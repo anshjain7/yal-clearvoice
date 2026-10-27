@@ -10,6 +10,7 @@ pub mod format;
 pub mod frame;
 pub mod https;
 pub mod ipc;
+pub mod livetse;
 pub mod playback;
 pub mod record;
 pub mod ring;

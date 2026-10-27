@@ -346,7 +346,9 @@ fn pump(
                 pair[0] = *d;
                 pair[1] = *o;
             }
-            copy.seq = out.seq;
+            // Numbered as the frame it came from (`dry`), so a stage before
+            // this one can line its own copies up with it.
+            copy.seq = frame.seq.saturating_sub(delay);
             // Full: the copy is dropped, never the frame going out.
             let _ = t.push(&copy);
         }
@@ -675,7 +677,7 @@ mod tests {
         });
         for (i, o) in outs.iter().enumerate() {
             let copy = tap_rx.pop().expect("a copy of every frame sent");
-            assert_eq!((copy.channels(), copy.seq), (2, o.seq));
+            assert_eq!((copy.channels(), copy.seq), (2, o.seq.saturating_sub(3)));
             let (mic, sent): (Vec<f32>, Vec<f32>) = copy
                 .samples()
                 .as_chunks::<2>()

@@ -102,15 +102,26 @@ transcript listens to it too, by loopback of VB-CABLE, like the customer's
 side from the headset. The TSE step needs a causal (live) target speaker
 model; until one ships, it passes the voice on unchanged, so the chain is
 DeepFilterNet3 alone. (WeSep's public model looks at audio after each
-moment as well as before, so it can't run live: it would delay the voice by
-seconds.)
+moment as well as before, so it can't run live without delaying the voice
+by seconds.)
+
+To try today's WeSep on a call anyway, tick **Live voice filter (test)**
+(shown when the WeSep files ship with the engine; off at every start, and
+it asks first). The TSE step then runs WeSep on the microphone 2 s at a
+time, with 0.5 s before each piece for context, and plays the result 4 s
+behind: the customer hears the agent 4 s late. A piece WeSep hasn't
+finished by then is sent as silence (the window shows "PC too slow"); one
+it fails on, as recorded. Unticking it goes back to the normal chain at
+once. On the development PC (i5-12450H) it needs `[voice] threads = 2` or
+more: real-time factor 0.67 at 2 threads, 1.05 (falling behind) at 1.
 
 While a call is recorded, the agent's own voice is saved at each step of the
 live chain, each covering the same stretch, in a folder per call,
 `Recordings\Agent voice\<date time>\`:
 
 - `input.m4a`: the microphone;
-- `audio_tse.m4a`: after TSE (the microphone, until the chain has a TSE model);
+- `audio_tse.m4a`: after TSE (the microphone, while the live voice filter
+  is off; with it on, WeSep's output, lined up with `input`);
 - `audio_tse_se.m4a`: after DeepFilterNet3 too: what the customer and the
   transcript get;
 - `rtf.csv`: each step's real-time factor (time it took / length of the
@@ -147,6 +158,7 @@ and the engine replies with one JSON line. No audio crosses the pipe.
 | `poll` | telemetry |
 | `list` | device list |
 | `nc on` / `nc off` | telemetry |
+| `tse on` / `tse off` | telemetry; the live voice filter (test) |
 | `mic <id>` / `mic default` | telemetry |
 | `spk <id>` / `spk default` | telemetry |
 | `strength <0-100>` | telemetry (accepted, but has no effect until the engine exposes the attenuation limit) |
@@ -170,6 +182,9 @@ Telemetry:
  "cpu_pct":8,"errors":0,"strength_supported":false,
  "mic_name":"Microphone (Detecta 201 USB)","headset_name":"Speakers (Detecta 201 USB)"}
 ```
+
+Newer engines add `voice` and `live_tse` (the live voice filter: `off`,
+`on`, `late`, `failed`, or `unavailable` without the WeSep files).
 
 `notice` codes:
 

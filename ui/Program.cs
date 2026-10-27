@@ -104,6 +104,10 @@ sealed class MainForm : Form
     readonly ComboBox _mic = new() { DropDownStyle = ComboBoxStyle.DropDownList };
     readonly ComboBox _spk = new() { DropDownStyle = ComboBoxStyle.DropDownList };
     readonly CheckBox _nc = new() { Text = "Noise cancellation", AutoSize = true };
+    // WeSep on the live call, before noise removal (a test: the agent's voice
+    // reaches the customer seconds late). Shown when the engine has WeSep.
+    readonly CheckBox _liveTse = new() { Text = "Live voice filter (test)", AutoSize = true, Visible = false };
+    readonly Label _liveTseStatus = new() { AutoSize = true, ForeColor = Muted };
     readonly Label _headset = new();
     readonly Label _conn = new();
     readonly Label _dfn = new();
@@ -186,6 +190,19 @@ sealed class MainForm : Form
         _nc.CheckedChanged += (_, _) =>
         {
             if (!_loading) _commands.Enqueue(_nc.Checked ? "nc on" : "nc off");
+        };
+        _liveTse.CheckedChanged += (_, _) =>
+        {
+            if (_loading) return;
+            if (_liveTse.Checked && MessageBox.Show(this, LiveTsePrompt, "Live voice filter (test)",
+                    MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK)
+            {
+                _loading = true;
+                _liveTse.Checked = false;
+                _loading = false;
+                return;
+            }
+            _commands.Enqueue(_liveTse.Checked ? "tse on" : "tse off");
         };
         // The agent starts and stops transcription. Stopping ends the call, and
         // the worker then writes its summary.
@@ -288,6 +305,14 @@ sealed class MainForm : Form
         + "Your voice sample is kept on this PC, for your Windows account only, and used "
         + "only to recognise your voice in transcripts. You can register again at any time.";
 
+    const string LiveTsePrompt =
+        "This is a test. It runs the voice filter (WeSep) on your microphone during the "
+        + "call, before noise removal, so the customer hears only your registered voice.\n\n"
+        + "Your voice will reach the customer about 4 seconds late. Use it only on test "
+        + "calls, not with real customers.\n\n"
+        + "If your PC can't keep up, short gaps of silence are sent instead. Untick it to "
+        + "go back to normal at once.";
+
     const string UploadPrompt =
         "Instead of recording now, you can use a recording of your voice that you already "
         + "have, for example a WAV or MP3 file on your Desktop.\n\n"
@@ -382,6 +407,10 @@ sealed class MainForm : Form
         _nc.Location = new Point(16, y);
         _nc.ForeColor = Teal;
         Controls.Add(_nc);
+        _liveTse.Location = new Point(176, y);
+        Controls.Add(_liveTse);
+        _liveTseStatus.Location = new Point(340, y + 2);
+        Controls.Add(_liveTseStatus);
         y += 36;
 
         Header("Status");
@@ -638,6 +667,14 @@ sealed class MainForm : Form
         string micName = r.TryGetValue("mic_name", out var mn) ? mn as string ?? "" : "";
         string headsetName = r.TryGetValue("headset_name", out var hn) ? hn as string ?? "" : "";
         string voice = r.TryGetValue("voice", out var vo) ? vo as string ?? "off" : "off";
+        string liveTse = r.TryGetValue("live_tse", out var lt) ? lt as string ?? "unavailable" : "unavailable";
+        var (liveText, liveColor) = liveTse switch
+        {
+            "on" => ("On", Teal),
+            "late" => ("PC too slow", Ink),
+            "failed" => ("Error", Ink),
+            _ => ("", Muted),
+        };
         var (voiceText, voiceColor) = voice switch
         {
             "no_sample" => ("Not registered yet", Ink),
@@ -700,6 +737,11 @@ sealed class MainForm : Form
             _headset.ForeColor = headsetName.Length > 0 ? Ink : Muted;
             _latency.Text = latency > 0 ? $"{latency} ms" : "—";
             _nc.Checked = nc;
+            _liveTse.Visible = liveTse != "unavailable";
+            if (liveTse is "on" or "late") _liveTse.Checked = true;
+            else if (liveTse == "off") _liveTse.Checked = false;
+            _liveTseStatus.Text = liveText;
+            _liveTseStatus.ForeColor = liveColor;
             if (!spkSelectable && !_spkLocked)
             {
                 _spk.Items.Clear();
