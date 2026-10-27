@@ -110,10 +110,13 @@ To try today's WeSep on a call anyway, tick **Live voice filter (test)**
 it asks first). The TSE step then runs WeSep on the microphone 2 s at a
 time, with 0.5 s before each piece for context, and plays the result 4 s
 behind: the customer hears the agent 4 s late. A piece WeSep hasn't
-finished by then is sent as silence (the window shows "PC too slow"); one
-it fails on, as recorded. Unticking it goes back to the normal chain at
-once. On the development PC (i5-12450H) it needs `[voice] threads = 2` or
-more: real-time factor 0.67 at 2 threads, 1.05 (falling behind) at 1.
+finished by then is sent as silence (the window shows "PC too slow"), and
+the delay stays 4 s; one it fails on, as recorded. Unticking it goes back to
+the normal chain at once. WeSep gets half the PC's logical processors, 2 to
+4 (or `[voice] threads`, if more). On the development PC (i5-12450H, on
+battery, with DeepFilterNet3 running too) its real-time factor was 0.50 at
+4 threads and 0.66 at 2, but swung up to 1.2 at times on battery: then it
+falls behind.
 
 While a call is recorded, the agent's own voice is saved at each step of the
 live chain, each covering the same stretch, in a folder per call,

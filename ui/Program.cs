@@ -108,6 +108,10 @@ sealed class MainForm : Form
     // reaches the customer seconds late). Shown when the engine has WeSep.
     readonly CheckBox _liveTse = new() { Text = "Live voice filter (test)", AutoSize = true, Visible = false };
     readonly Label _liveTseStatus = new() { AutoSize = true, ForeColor = Muted };
+    // The agent's choice (UI thread). Kept apart from the box: the engine's
+    // status mustn't untick it while the warning is open, and the switch is
+    // sent again if the engine reports it off (restarted, or not there yet).
+    bool _liveTseWanted;
     readonly Label _headset = new();
     readonly Label _conn = new();
     readonly Label _dfn = new();
@@ -202,7 +206,8 @@ sealed class MainForm : Form
                 _loading = false;
                 return;
             }
-            _commands.Enqueue(_liveTse.Checked ? "tse on" : "tse off");
+            _liveTseWanted = _liveTse.Checked;
+            _commands.Enqueue(_liveTseWanted ? "tse on" : "tse off");
         };
         // The agent starts and stops transcription. Stopping ends the call, and
         // the worker then writes its summary.
@@ -738,9 +743,8 @@ sealed class MainForm : Form
             _latency.Text = latency > 0 ? $"{latency} ms" : "—";
             _nc.Checked = nc;
             _liveTse.Visible = liveTse != "unavailable";
-            if (liveTse is "on" or "late") _liveTse.Checked = true;
-            else if (liveTse == "off") _liveTse.Checked = false;
-            _liveTseStatus.Text = liveText;
+            if (_liveTseWanted && liveTse == "off") _commands.Enqueue("tse on");
+            _liveTseStatus.Text = _liveTseWanted && liveTse == "off" ? "Starting…" : liveText;
             _liveTseStatus.ForeColor = liveColor;
             if (!spkSelectable && !_spkLocked)
             {

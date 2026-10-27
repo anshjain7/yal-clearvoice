@@ -65,6 +65,14 @@ pub struct Control {
 /// WeSep's output (16 kHz) and how long it took.
 type Done = (u64, bool, Result<Vec<f32>, String>, Duration);
 
+/// WeSep's threads on the live call: half the PC's logical processors, 2 to
+/// 4 (2 threads fell behind on the development PC on battery), or `wanted`
+/// (settings.ini) if more.
+pub fn threads(wanted: usize) -> usize {
+    let half = thread::available_parallelism().map_or(2, |n| n.get() / 2);
+    half.clamp(2, 4).max(wanted)
+}
+
 /// What WeSep works with: its files, its threads, and the voice sample.
 pub struct Setup {
     pub files: tse::Files,
@@ -174,6 +182,10 @@ struct On {
     /// Blocks sent to WeSep and not back yet, with their microphone audio,
     /// in case WeSep fails on them.
     pending: VecDeque<Vec<f32>>,
+    /// Silence sent in place of audio that wasn't ready (48 kHz samples):
+    /// that much of what comes back is past its time and is dropped, so the
+    /// delay stays DELAY_FRAMES.
+    owed: usize,
 }
 
 impl On {
@@ -188,7 +200,17 @@ impl On {
             mics: (0..DELAY_FRAMES).map(|_| silent).collect(),
             ready: VecDeque::from(vec![0.0; DELAY_FRAMES * FRAME]),
             pending: VecDeque::new(),
+            owed: 0,
         }
+    }
+
+    /// Queues audio to play, minus what silence already stood in for.
+    fn ready(&mut self, audio: impl IntoIterator<Item = f32>) {
+        let mut audio = audio.into_iter();
+        while self.owed > 0 && audio.next().is_some() {
+            self.owed -= 1;
+        }
+        self.ready.extend(audio);
     }
 
     /// Adds a microphone frame; once a block is full, returns it for WeSep:
@@ -217,13 +239,14 @@ impl On {
         for (i, v) in new.iter().enumerate() {
             stuffed[i * DOWN] = v * DOWN as f32;
         }
-        self.ready.extend(self.up.filter(&stuffed, 1));
+        let up = self.up.filter(&stuffed, 1);
+        self.ready(up);
     }
 
     /// WeSep failed on the oldest block: it plays as recorded.
     fn finished_raw(&mut self) {
         if let Some(block) = self.pending.pop_front() {
-            self.ready.extend(block);
+            self.ready(block);
         }
     }
 
@@ -233,7 +256,11 @@ impl On {
         let mic = self.mics.pop_front().unwrap_or(AudioFrame::new(1));
         let mut out = AudioFrame::new(1);
         let late = self.ready.len() < FRAME;
-        if !late {
+        if late {
+            // What's there is played next time with the rest; the frame's
+            // worth after it is owed.
+            self.owed += FRAME;
+        } else {
             for s in out.samples_mut() {
                 *s = self.ready.pop_front().unwrap_or(0.0);
             }
@@ -363,9 +390,51 @@ mod tests {
         }
         assert!(s.next(&tone_frame(DELAY_FRAMES)).2);
     }
+
+    #[test]
+    fn a_late_block_does_not_add_to_the_delay() {
+        // A slow ramp: each moment has its own level.
+        let ramp = |k: usize| {
+            let mut f = AudioFrame::new(1);
+            f.seq = k as u64;
+            for (i, s) in f.samples_mut().iter_mut().enumerate() {
+                *s = (k * FRAME + i) as f32 / 48_000.0 * 0.1;
+            }
+            f
+        };
+        let mean = |x: &[f32]| x.iter().sum::<f32>() / x.len() as f32;
+        let mut s = On::new();
+        let mut held = Vec::new();
+        let mut outs = Vec::new();
+        for k in 0..DELAY_FRAMES + 3 * BLOCK_FRAMES {
+            if let Some(job) = s.push(&ramp(k)) {
+                held.push(job);
+            }
+            // The first block comes back 50 frames late, the rest on time.
+            if k >= DELAY_FRAMES + 50 {
+                for job in held.drain(..) {
+                    s.finished(&job);
+                }
+            }
+            outs.push(s.next(&ramp(k)));
+        }
+        let late = outs.iter().filter(|(.., late)| *late).count();
+        assert_eq!(late, 50);
+        // After the gap: the microphone, still DELAY_FRAMES behind, and the
+        // cleaned audio of that same moment (0.005 is 50 frames of ramp).
+        for (k, (out, mic, late)) in outs.iter().enumerate().skip(DELAY_FRAMES + 60) {
+            assert!(!late, "frame {k} late");
+            assert_eq!(mic.samples(), ramp(k - DELAY_FRAMES).samples());
+            let off = mean(out.samples()) - mean(mic.samples());
+            assert!(off.abs() < 0.0005, "frame {k}: {off}");
+        }
+    }
+
     /// The stage on a real recording, in real time, with today's WeSep:
     /// YAL_LIVETSE_TEST="<dir with onnxruntime.dll and wesep\>|<voice
     /// sample.wav>|<recording>|<out.wav>". Prints how far behind WeSep fell.
+    /// With YAL_LIVETSE_DFN (DeepFilterNet3_onnx.tar.gz), the output goes
+    /// through noise removal too, as in the app.
     /// cargo test --release live_tse_on_a_recording -- --ignored --nocapture
     #[test]
     #[ignore = "needs the WeSep files and a recording; runs in real time"]
@@ -381,7 +450,8 @@ mod tests {
         std::fs::write(&voice, crate::record::wav_bytes(&enrolled)).unwrap();
         let setup = Setup {
             files: tse::Files::find(std::path::Path::new(dir)).expect("WeSep files"),
-            threads: std::env::var("YAL_LIVETSE_THREADS").map_or(2, |t| t.parse().unwrap()),
+            threads: std::env::var("YAL_LIVETSE_THREADS")
+                .map_or(threads(2), |t| t.parse().unwrap()),
             sample: voice.clone(),
         };
         // 48 kHz: each 16 kHz sample three times, then smoothed.
@@ -395,11 +465,25 @@ mod tests {
         let control = Control::default();
         control.enabled.store(true, Relaxed);
         let (mut tx, mut rx) = ring::new(64);
-        let (mut out_tx, mut out_rx) = ring::new(64);
+        let (mut out_tx, mut out_rx) = ring::new(16);
+        let (mut df_tx, mut df_rx) = ring::new(64);
+        let (models, models_rx) = mpsc::channel();
+        let df_control = crate::denoise::Control::default();
+        df_control.enabled.store(true, Relaxed);
         let (mut late, mut sent) = (Vec::new(), Vec::new());
         thread::scope(|s| {
             let (rx, out_tx, control) = (&mut rx, &mut out_tx, &control);
             s.spawn(move || run(rx, out_tx, None, control, setup));
+            let heard_rx = match std::env::var("YAL_LIVETSE_DFN") {
+                Ok(model) => {
+                    let df = crate::denoise::DeepFilter::new(std::path::Path::new(&model), 15.0);
+                    models.send(df.unwrap()).unwrap();
+                    let (input, output, dc) = (&mut out_rx, &mut df_tx, &df_control);
+                    s.spawn(move || crate::denoise::run(models_rx, input, output, dc));
+                    &mut df_rx
+                }
+                Err(_) => &mut out_rx,
+            };
             let started = Instant::now();
             for k in 0..frames + DELAY_FRAMES {
                 let mut f = AudioFrame::new(1);
@@ -411,7 +495,7 @@ mod tests {
                 assert!(tx.push(&f));
                 let due = started + Duration::from_millis(10 * (k as u64 + 1));
                 thread::sleep(due.saturating_duration_since(Instant::now()));
-                while let Some(o) = out_rx.pop() {
+                while let Some(o) = heard_rx.pop() {
                     sent.extend_from_slice(o.samples());
                 }
                 if ipc::TELEMETRY.live_tse.load(Relaxed) == LATE {
@@ -420,6 +504,7 @@ mod tests {
                 }
             }
             control.stop.store(true, Relaxed);
+            df_control.stop.store(true, Relaxed);
         });
         let (handled, busy) = (control.handled.load(Relaxed), control.busy_us.load(Relaxed));
         println!(

@@ -248,7 +248,7 @@ fn main() {
     // switched on from the window to test it. Off at start.
     let live_setup = tse::Files::find(&exe_dir).map(|files| livetse::Setup {
         files,
-        threads: voice::local_options(&ini).1,
+        threads: livetse::threads(voice::local_options(&ini).1),
         sample: voice::sample_path(),
     });
     let has_live = live_setup.is_some();
