@@ -80,11 +80,12 @@ api_key = <key>
 attenuation_db = 15    ; 6..100 dB; 100 = all it can (sounds muffled with a
                        ; noise-cancelling headset like the Detecta 201)
 [voice]                ; optional
-remix = 0              ; how much of the original is mixed back in (0 = none;
-                       ; with a voice server the default is 0.2)
+remix = 0              ; how much of the original is mixed back in (0 = none)
 threads = 2            ; for WeSep on this PC (1-8)
 url = http://<server>:8090   ; only to use a voice server instead
 api_key = <key>
+context = 6            ; voice server only: seconds before each block sent
+                       ; along (0-20)
 ```
 
 The window shows **Register my voice** (a 20 s voice sample). The agent's side of
@@ -92,15 +93,20 @@ the transcript then goes through WeSep speaker extraction: on the PC (the
 `wesep\` folder and `onnxruntime.dll` ship with the app), or on a voice server
 when `[voice] url` is set (see `voice-server/README.md`).
 
-On the PC it follows the team's configuration (`run_tse.sh`, then
+Either way it follows the team's configuration (`run_tse.sh`, then
 `run_se.sh`): WeSep works on the agent's raw microphone, before noise
-removal, on every 2 s of it one after another (no overlapping chunks), with
-no remix; then DeepFilterNet3 speech enhancement (at the `[noise]` limit)
-cleans the result. That's what the transcript gets. It runs below normal
-priority, so call audio is never affected, and extracts every block whatever
-the PC's speed: on a PC slower than WeSep needs, the agent's side of the
-transcript falls further behind as the call goes on, and what's still
-waiting when the call ends isn't transcribed.
+removal, on every 2 s of it one after another, with no remix; then
+DeepFilterNet3 speech enhancement on the PC (at the `[noise]` limit) cleans
+the result. That's what the transcript gets. A voice server also gets the
+6 s before each block (`context`): WeSep judges whose voice is whose from
+its whole input, so 2 s alone gives a rougher result than running a whole
+recording offline. That context is too slow on an agent's CPU, so on the PC
+each block goes alone.
+
+On the PC it runs below normal priority, so call audio is never affected,
+and extracts every block whatever the PC's speed: on a PC slower than WeSep
+needs, the agent's side of the transcript falls further behind as the call
+goes on, and what's still waiting when the call ends isn't transcribed.
 
 While a call is recorded, the agent's own voice is saved before and after the
 models, covering the same stretch, in `Recordings\Agent voice\`:

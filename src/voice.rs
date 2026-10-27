@@ -8,17 +8,20 @@
 //! `[voice]` server from settings.ini. Only the transcript is affected; the
 //! call itself still gets the voice straight from noise removal.
 //!
-//! On this PC it follows the team's configuration:
+//! Both follow the team's configuration:
 //!
 //!   run_tse.sh --enroll <voice sample> --input <microphone>
 //!   run_se.sh <that> <transcript>
 //!
 //! WeSep works on the raw microphone (before any noise removal), on every
-//! 2 s of it one after another (no overlapping chunks), with nothing of the
-//! original mixed back in; then speech enhancement (enhance.rs,
-//! DeepFilterNet3) cleans the result. So the agent's lines reach the
-//! transcript a few seconds later. (A `[voice]` server instead works on the
-//! call's cleaned voice, as before.)
+//! 2 s of it one after another, with nothing of the original mixed back in;
+//! then speech enhancement (enhance.rs, DeepFilterNet3) on this PC cleans
+//! the result. So the agent's lines reach the transcript a few seconds
+//! later. A server also gets the seconds before each block (`[voice]
+//! context`, 6 s unless set) and returns only the block: WeSep weighs its
+//! whole input at once, and offline it hears the whole recording, so with
+//! 2 s alone it misjudges which voice is the agent's. That context would be
+//! too slow on the agent's own CPU.
 //!
 //! On this PC it stays out of the call's way: it runs on its own thread below
 //! normal priority (noise removal and the audio threads run at Pro Audio
@@ -53,6 +56,10 @@ const BLOCK: usize = 2 * RATE as usize;
 pub const SAMPLE_SECONDS: usize = 20;
 /// Speech the sample must hold to be any use: 6 s.
 const SAMPLE_MIN_SPEECH: usize = 60;
+/// Seconds before each block sent to a server for context, unless
+/// settings.ini says otherwise, and the most it may say.
+const SERVER_CONTEXT_SECONDS: f32 = 6.0;
+const MAX_CONTEXT_SECONDS: f32 = 20.0;
 /// After the server fails, the original audio is transcribed for this long
 /// before trying it again.
 const OFF_AFTER_FAILURE: Duration = Duration::from_secs(30);
@@ -68,12 +75,15 @@ pub struct Settings {
     pub api_key: String,
     /// How much of the original to mix back in (run_tse.sh's --remix).
     pub remix: f32,
+    /// Samples of the audio before each block sent along for context.
+    pub context: usize,
 }
 
 impl Settings {
     /// Reads settings.ini's text. None when it has no `[voice]` url.
     pub fn parse(ini: &str) -> Option<Settings> {
-        let (mut section, mut url, mut api_key, mut remix) = ("", "", "", 0.2f32);
+        let (mut section, mut url, mut api_key, mut remix) = ("", "", "", 0.0f32);
+        let mut context = SERVER_CONTEXT_SECONDS;
         for line in ini.trim_start_matches('\u{feff}').lines().map(str::trim) {
             if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
                 section = name.trim();
@@ -86,6 +96,9 @@ impl Settings {
                     "url" => url = v,
                     "api_key" => api_key = v,
                     "remix" => remix = v.parse().unwrap_or(remix).clamp(0.0, 1.0),
+                    "context" => {
+                        context = v.parse().unwrap_or(context).clamp(0.0, MAX_CONTEXT_SECONDS);
+                    }
                     _ => {}
                 }
             }
@@ -94,14 +107,20 @@ impl Settings {
             url: url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             remix,
+            context: (context * RATE as f32) as usize,
         })
     }
 }
 
-/// Where the agent's voice is extracted.
+/// Where the agent's voice is extracted. Either way it comes from the raw
+/// microphone and goes through speech enhancement after.
 pub enum Backend {
     /// A `[voice]` server.
-    Server(Settings),
+    Server {
+        settings: Settings,
+        /// DeepFilterNet3 for speech enhancement, and its attenuation limit.
+        enhance: (PathBuf, f32),
+    },
     /// On this PC, with the WeSep files that ship with the engine, on the raw
     /// microphone, then speech enhancement.
     Local {
@@ -218,35 +237,39 @@ pub fn import_sample(file: &Path, path: &Path) {
 /// Sits between the agent side's listener and its Sarvam relay: while a call
 /// is being transcribed and there's a voice sample, extracts the agent's
 /// voice from every 2 s block and passes on the result; otherwise, or when
-/// extraction fails, passes the audio on without it. On this PC everything
-/// passed on during a call then goes through speech enhancement. Runs until
-/// `input` closes.
+/// extraction fails, passes the audio on without it. Everything passed on
+/// during a call then goes through speech enhancement. Runs until `input`
+/// closes.
 pub fn clean(backend: &Backend, input: Receiver<Vec<i16>>, out: Sender<Vec<i16>>) {
     below_normal_priority();
-    let (mut engine, mut enhancer) = match backend {
-        Backend::Server(settings) => (
+    let (mut engine, (model, attenuation), context) = match backend {
+        Backend::Server { settings, enhance } => (
             Engine::Server(Client::new(settings.clone(), sample_path())),
-            None,
+            enhance,
+            settings.context,
         ),
         Backend::Local {
             files,
             remix,
             threads,
-            enhance: (model, attenuation),
+            enhance,
         } => (
             Engine::Local(Box::new(Local::new(files, *remix, *threads, sample_path()))),
-            // Without it the agent's voice is transcribed unenhanced: noisier,
-            // but nothing is lost.
-            Enhancer::new(model, *attenuation).ok(),
+            enhance,
+            0,
         ),
     };
+    // Without it the agent's voice is transcribed unenhanced: noisier, but
+    // nothing is lost.
+    let mut enhancer = Enhancer::new(model, *attenuation).ok();
     let mut blocks = Blocks::default();
+    // The audio just before the block being gathered, for a server's context.
+    let mut recent = Recent::new(context);
     let mut off_until: Option<Instant> = None;
     // While the call is also being recorded: the agent's voice before and
-    // after the models, saved beside it. Before only on this PC, where the
-    // input is the raw microphone (a server gets the call's cleaned voice).
+    // after the models, saved beside it.
     let mut savers = Savers {
-        noisy: matches!(engine, Engine::Local(_)).then(|| Saver::new("noisy")),
+        noisy: Saver::new("noisy"),
         cleaned: Saver::new("cleaned"),
     };
     for chunk in input {
@@ -257,6 +280,7 @@ pub fn clean(backend: &Backend, input: Receiver<Vec<i16>>, out: Sender<Vec<i16>>
             // Audio held for a block that won't be cleaned goes on as it is.
             let mut audio = blocks.flush();
             audio.extend(&chunk);
+            recent.add(&audio);
             // Speech enhancement only during a call: between calls nothing is
             // transcribed, and it would keep a core busy for nothing.
             let enhance = enhancer.as_mut().filter(|_| calling);
@@ -266,7 +290,9 @@ pub fn clean(backend: &Backend, input: Receiver<Vec<i16>>, out: Sender<Vec<i16>>
         let Some(block) = blocks.push(&chunk) else {
             continue;
         };
-        let cleaned = match engine.extract(&block) {
+        let result = engine.extract(recent.audio(), &block);
+        recent.add(&block);
+        let cleaned = match result {
             Ok(cleaned) => {
                 set_state(ipc::VOICE_READY);
                 off_until = None;
@@ -282,9 +308,7 @@ pub fn clean(backend: &Backend, input: Receiver<Vec<i16>>, out: Sender<Vec<i16>>
     }
     let rest = blocks.flush();
     send(&rest, &rest, enhancer.as_mut(), &mut savers, &out);
-    if let Some(noisy) = &mut savers.noisy {
-        noisy.save(None, &[]);
-    }
+    savers.noisy.save(None, &[]);
     savers.cleaned.save(None, &[]);
 }
 
@@ -303,9 +327,7 @@ fn send(
         None => cleaned.to_vec(),
     };
     let recording = record::recording();
-    if let Some(noisy) = &mut savers.noisy {
-        noisy.save(recording.clone(), raw);
-    }
+    savers.noisy.save(recording.clone(), raw);
     for c in audio.chunks(CHUNK) {
         savers.cleaned.save(recording.clone(), c);
         let _ = out.send(c.to_vec());
@@ -314,8 +336,8 @@ fn send(
 
 /// The agent's voice files for the call being recorded.
 struct Savers {
-    /// Before the models; None when the input isn't the raw microphone.
-    noisy: Option<Saver>,
+    /// Before the models: the raw microphone.
+    noisy: Saver,
     /// After them: what the transcript gets (run_tse.sh then run_se.sh's
     /// output).
     cleaned: Saver,
@@ -376,6 +398,32 @@ impl Blocks {
     }
 }
 
+/// The latest audio, up to a length, cleaned or not: a server's context.
+struct Recent {
+    audio: Vec<i16>,
+    keep: usize,
+}
+
+impl Recent {
+    fn new(keep: usize) -> Recent {
+        Recent {
+            audio: Vec::with_capacity(keep + BLOCK),
+            keep,
+        }
+    }
+
+    /// Adds audio that just went by, forgetting what's beyond `keep`.
+    fn add(&mut self, audio: &[i16]) {
+        self.audio.extend_from_slice(audio);
+        let over = self.audio.len().saturating_sub(self.keep);
+        self.audio.drain(..over);
+    }
+
+    fn audio(&self) -> &[i16] {
+        &self.audio
+    }
+}
+
 /// Whichever extracts: the server or this PC.
 enum Engine {
     Server(Client),
@@ -390,10 +438,11 @@ impl Engine {
         }
     }
 
-    /// The agent's voice extracted from `block` (same length).
-    fn extract(&mut self, block: &[i16]) -> Result<Vec<i16>, String> {
+    /// The agent's voice extracted from `block` (same length), with the
+    /// audio just before it as context (a server's only: too slow on this PC).
+    fn extract(&mut self, context: &[i16], block: &[i16]) -> Result<Vec<i16>, String> {
         match self {
-            Engine::Server(c) => c.extract(&[], block),
+            Engine::Server(c) => c.extract(context, block),
             Engine::Local(l) => l.extract(block),
         }
     }
@@ -765,17 +814,24 @@ mod tests {
     #[test]
     fn settings_read_only_the_voice_section() {
         let ini = "[summary]\nurl = http://a/v1\n[voice]\nurl = http://10.0.0.5:8090/ ; tse\n\
-                   api_key = k1\nremix = 0.3\n";
+                   api_key = k1\nremix = 0.3\ncontext = 8 ; seconds\n";
         assert_eq!(
             Settings::parse(ini),
             Some(Settings {
                 url: "http://10.0.0.5:8090".into(),
                 api_key: "k1".into(),
-                remix: 0.3
+                remix: 0.3,
+                context: 8 * RATE as usize,
             })
         );
+        // No remix and 6 s of context unless set; context at most 20 s.
         let s = Settings::parse("[voice]\nurl = https://tse.example.com/yal\n").unwrap();
-        assert_eq!((s.remix, s.api_key.as_str()), (0.2, ""));
+        assert_eq!(
+            (s.remix, s.api_key.as_str(), s.context),
+            (0.0, "", 6 * RATE as usize)
+        );
+        let s = Settings::parse("[voice]\nurl = http://x\ncontext = 99\n").unwrap();
+        assert_eq!(s.context, 20 * RATE as usize);
         assert_eq!(Settings::parse("[voice]\n; url = http://x\n"), None);
         assert_eq!(Settings::parse("[voice]\nurl = ftp://x\n"), None);
         assert_eq!(Settings::parse("[summary]\nurl = http://x\n"), None);
@@ -804,6 +860,19 @@ mod tests {
         let r = b"HTTP/1.0 404 Not Found\r\n\r\nnope";
         assert_eq!(parse_response(r).unwrap(), (404, b"nope".to_vec()));
         assert!(parse_response(b"garbage").is_err());
+    }
+
+    #[test]
+    fn recent_keeps_the_latest_audio() {
+        let mut r = Recent::new(5);
+        assert!(r.audio().is_empty());
+        r.add(&[1, 2, 3]);
+        assert_eq!(r.audio(), [1, 2, 3]);
+        r.add(&[4, 5, 6, 7]);
+        assert_eq!(r.audio(), [3, 4, 5, 6, 7]);
+        let mut none = Recent::new(0);
+        none.add(&[1, 2]);
+        assert!(none.audio().is_empty());
     }
 
     #[test]
@@ -885,6 +954,7 @@ mod tests {
             url,
             api_key: "k".into(),
             remix: 0.2,
+            context: 0,
         };
         let mut client = Client::new(settings, sample);
         let want: Vec<i16> = block.iter().map(|s| s * 10).collect();
@@ -1027,8 +1097,8 @@ mod tests {
     }
 
     /// Against a real voice server (voice-server/voice_server.py): sends a
-    /// recording through it in 2 s blocks, as during a call, and reports how
-    /// long each took. Set YAL_VOICE_TEST to "<url>|<key>|<voice sample.wav>|
+    /// recording through it in 2 s blocks with the seconds before each, as
+    /// during a call, and reports how long each took. Set YAL_VOICE_TEST to "<url>|<key>|<voice sample.wav>|
     /// <noisy recording.wav>|<output.wav>" (16 kHz mono).
     /// cargo test --release extracts_through_a_server -- --ignored --nocapture
     #[test]
@@ -1048,22 +1118,23 @@ mod tests {
                 .collect()
         };
         let audio = read(input);
-        let settings = Settings {
-            url: url.into(),
-            api_key: key.into(),
-            remix: 0.2,
-        };
-        let mut client = Client::new(settings, PathBuf::from(sample));
+        // settings.ini's defaults: no remix, 6 s of context.
+        let settings =
+            Settings::parse(&format!("[voice]\nurl = {url}\napi_key = {key}\n")).unwrap();
+        let mut client = Client::new(settings.clone(), PathBuf::from(sample));
         let (mut blocks, mut cleaned) = (Blocks::default(), Vec::new());
+        let mut recent = Recent::new(settings.context);
         for chunk in audio.chunks(CHUNK) {
             if let Some(block) = blocks.push(chunk) {
                 let t = Instant::now();
-                let out = client.extract(&[], &block).unwrap();
+                let out = client.extract(recent.audio(), &block).unwrap();
                 println!(
-                    "block of {:.1} s: {} ms",
+                    "block of {:.1} s with {:.1} s of context: {} ms",
                     block.len() as f32 / RATE as f32,
+                    recent.audio().len() as f32 / RATE as f32,
                     t.elapsed().as_millis()
                 );
+                recent.add(&block);
                 assert_eq!(out.len(), block.len());
                 cleaned.extend(out);
             }
@@ -1090,6 +1161,7 @@ mod tests {
                 url,
                 api_key: String::new(),
                 remix: 0.2,
+                context: 0,
             },
             sample,
         );

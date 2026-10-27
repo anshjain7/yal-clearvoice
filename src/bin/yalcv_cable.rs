@@ -212,15 +212,16 @@ fn main() {
     // Keeping other voices out of the transcript: a [voice] server if there
     // is one, else WeSep on this PC when its files ship with the engine.
     let exe_dir = beside_exe("");
+    let enhance = (beside_exe("DeepFilterNet3_onnx.tar.gz"), attenuation);
     let voice_backend = match voice::Settings::parse(&ini) {
-        Some(server) => Some(voice::Backend::Server(server)),
+        Some(settings) => Some(voice::Backend::Server { settings, enhance }),
         None => tse::Files::find(&exe_dir).map(|files| {
             let (remix, threads) = voice::local_options(&ini);
             voice::Backend::Local {
                 files,
                 remix,
                 threads,
-                enhance: (beside_exe("DeepFilterNet3_onnx.tar.gz"), attenuation),
+                enhance,
             }
         }),
     };
@@ -294,17 +295,15 @@ fn main() {
         });
         // Both sides of the call, each recorded and relayed to Sarvam: the
         // customer by loopback of the agent's headset; the agent from their raw
-        // microphone when WeSep runs on this PC (extraction, then speech
-        // enhancement, in voice.rs), else by loopback of VB-CABLE (their
+        // microphone when WeSep runs (on this PC or a server; extraction, then
+        // speech enhancement, in voice.rs), else by loopback of VB-CABLE (their
         // cleaned voice). Off the audio path: nothing here touches the rings.
         if let Some(settings) = &transcription {
             let listen_stop = &listen_stop;
             let customer = agent_speaker as fn() -> Option<String>;
             let agent = match &voice_backend {
-                Some(voice::Backend::Local { .. }) => {
-                    (Direction::Input, mic_in_use as fn() -> Option<String>)
-                }
-                _ => (Direction::Output, cable_input as fn() -> Option<String>),
+                Some(_) => (Direction::Input, mic_in_use as fn() -> Option<String>),
+                None => (Direction::Output, cable_input as fn() -> Option<String>),
             };
             let sides = [
                 (Side::Customer, (Direction::Output, customer)),
@@ -313,7 +312,7 @@ fn main() {
             for (side, (direction, endpoint)) in sides {
                 let (tx, rx) = mpsc::channel();
                 s.spawn(move || transcribe::listen(direction, endpoint, tx, listen_stop));
-                // Only the agent's own voice, when there's a voice server.
+                // Only the agent's own voice, when WeSep runs.
                 let rx = match (&voice_backend, side) {
                     (Some(backend), Side::Agent) => {
                         let (clean_tx, clean_rx) = mpsc::channel();

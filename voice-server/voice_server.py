@@ -1,8 +1,8 @@
 """YAL ClearVoice voice server: target speaker extraction for transcripts.
 
 The YAL ClearVoice app sends each agent's voice sample once (POST /enroll),
-then, during transcribed calls, the agent's audio 2 s at a time with 1 s of
-context before it (POST /extract). This server keeps only the agent's voice
+then, during transcribed calls, the agent's raw microphone 2 s at a time with
+the 6 s before it as context (POST /extract). This server keeps only the agent's voice
 (WeSep's BSRNN target speaker extraction, as run_tse.sh does), mixes part of
 the original back in (run_tse.sh's --remix), and returns the cleaned audio
 for the block, without the context.
