@@ -3,7 +3,7 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::Receiver;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -77,6 +77,10 @@ pub struct Control {
     /// failing one. Watch it to report failures.
     pub active: AtomicBool,
     pub stop: AtomicBool,
+    /// Frames handled so far, and the processing time they took (µs): their
+    /// real-time factor, for whoever reads them (stages.rs's rtf.csv).
+    pub handled: AtomicU64,
+    pub busy_us: AtomicU64,
 }
 
 impl Default for Control {
@@ -85,6 +89,8 @@ impl Default for Control {
             enabled: AtomicBool::new(true),
             active: AtomicBool::new(false),
             stop: AtomicBool::new(false),
+            handled: AtomicU64::new(0),
+            busy_us: AtomicU64::new(0),
         }
     }
 }
@@ -137,11 +143,32 @@ pub fn run(
     output: &mut Producer,
     control: &Control,
 ) -> Stats {
+    run_tapped(models, input, output, control, None)
+}
+
+/// `run`, also handing each frame to `tap` as it goes out: a stereo frame of
+/// the microphone (left) and what went out (right), lined up for the model's
+/// delay. The hand-off never waits: when `tap` is full the copy is dropped,
+/// never the frame going out.
+pub fn run_tapped(
+    models: Receiver<DeepFilter>,
+    input: &mut Consumer,
+    output: &mut Producer,
+    control: &Control,
+    mut tap: Option<&mut Producer>,
+) -> Stats {
     let mut stats = Stats::default();
     let _ = stream::realtime(|| {
         // Restart in bypass rather than let a panic silence the pipeline.
         while catch_unwind(AssertUnwindSafe(|| {
-            pump(&models, input, output, control, &mut stats)
+            pump(
+                &models,
+                input,
+                output,
+                control,
+                &mut stats,
+                tap.as_deref_mut(),
+            )
         }))
         .is_err()
         {
@@ -160,8 +187,10 @@ fn pump(
     output: &mut Producer,
     control: &Control,
     stats: &mut Stats,
+    mut tap: Option<&mut Producer>,
 ) {
     let mut model: Option<DeepFilter> = None;
+    let mut copy = AudioFrame::new(2);
     // Recent input frames by seq: the unprocessed audio, `delay` frames back,
     // lines up with what the model outputs now.
     let mut recent = [AudioFrame::new(1); MAX_DELAY_FRAMES as usize + 1];
@@ -303,6 +332,23 @@ fn pump(
             stats.frames += 1;
         } else {
             stats.dropped += 1;
+        }
+        control.handled.fetch_add(1, Relaxed);
+        control.busy_us.fetch_add(busy.as_micros() as u64, Relaxed);
+        if let Some(t) = tap.as_deref_mut() {
+            for (pair, (d, o)) in copy
+                .samples_mut()
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(dry.samples().iter().zip(out.samples()))
+            {
+                pair[0] = *d;
+                pair[1] = *o;
+            }
+            copy.seq = out.seq;
+            // Full: the copy is dropped, never the frame going out.
+            let _ = t.push(&copy);
         }
     }
 }
@@ -592,6 +638,60 @@ mod tests {
             control.stop.store(true, Relaxed);
             (out, stage.join().unwrap())
         })
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // native inference
+    fn tap_gets_each_frame_out_beside_its_microphone_audio() {
+        use crate::ring;
+        let input = tone(30);
+        let control = Control::default();
+        let (mut tx, mut rx) = ring::new(64);
+        let (mut out_tx, mut out_rx) = ring::new(64);
+        let (mut tap_tx, mut tap_rx) = ring::new(64);
+        let (models, models_rx) = mpsc::channel();
+        models.send(model()).unwrap();
+        let outs = thread::scope(|s| {
+            let stage = s.spawn(|| {
+                let tap = Some(&mut tap_tx);
+                run_tapped(models_rx, &mut rx, &mut out_tx, &control, tap)
+            });
+            for f in &input {
+                assert!(tx.push(f));
+            }
+            let (mut outs, started) = (Vec::new(), Instant::now());
+            while outs.len() < input.len() {
+                match out_rx.pop() {
+                    Some(o) => outs.push(o),
+                    None => {
+                        assert!(started.elapsed() < Duration::from_secs(10), "stage stalled");
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }
+            control.stop.store(true, Relaxed);
+            stage.join().unwrap();
+            outs
+        });
+        for (i, o) in outs.iter().enumerate() {
+            let copy = tap_rx.pop().expect("a copy of every frame sent");
+            assert_eq!((copy.channels(), copy.seq), (2, o.seq));
+            let (mic, sent): (Vec<f32>, Vec<f32>) = copy
+                .samples()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|p| (p[0], p[1]))
+                .unzip();
+            // Right: exactly what went out. Left: the microphone frame it came
+            // from, the model's 3 frames earlier.
+            assert_eq!(sent, o.samples());
+            let expected = i.checked_sub(3).map_or(AudioFrame::new(1), |j| input[j]);
+            assert_eq!(mic, expected.samples());
+        }
+        assert!(tap_rx.pop().is_none());
+        assert_eq!(control.handled.load(Relaxed), input.len() as u64);
+        assert!(control.busy_us.load(Relaxed) > 0);
     }
 
     #[test]

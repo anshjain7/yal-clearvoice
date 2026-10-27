@@ -87,30 +87,37 @@ url = http://<server>:8090   ; only to use a voice server instead
 api_key = <key>
 ```
 
-The window shows **Register my voice** (a 20 s voice sample). The agent's side of
-the transcript then goes through WeSep speaker extraction: on the PC (the
-`wesep\` folder and `onnxruntime.dll` ship with the app), or on a voice server
-when `[voice] url` is set (see `voice-server/README.md`).
+The window shows **Register my voice** (a 20 s voice sample): the voice TSE
+keeps. With a voice server (`[voice] url`, see `voice-server/README.md`), the
+agent's side of the transcript goes through WeSep there.
 
-On the PC it follows the team's configuration (`run_tse.sh`, then
-`run_se.sh`): WeSep works on the agent's raw microphone, before noise
-removal, on every 2 s of it one after another (no overlapping chunks), with
-no remix; then DeepFilterNet3 speech enhancement (at the `[noise]` limit)
-cleans the result. That's what the transcript gets. It runs below normal
-priority, so call audio is never affected, and extracts every block whatever
-the PC's speed: on a PC slower than WeSep needs, the agent's side of the
-transcript falls further behind as the call goes on, and what's still
-waiting when the call ends isn't transcribed.
+On the PC the agent's voice goes through one live chain, in the team's
+order (TSE as in `run_tse.sh`, then speech enhancement as in `run_se.sh`):
 
-While a call is recorded, the agent's own voice is saved at each step, each
-covering the same stretch, in a folder per call,
+    microphone -> TSE -> DeepFilterNet3 (at the [noise] limit) -> VB-CABLE
+
+What comes out goes to the calling app, so to the customer, and the
+transcript listens to it too, by loopback of VB-CABLE, like the customer's
+side from the headset. The TSE step needs a causal (live) target speaker
+model; until one ships, it passes the voice on unchanged, so the chain is
+DeepFilterNet3 alone. (WeSep's public model looks at audio after each
+moment as well as before, so it can't run live: it would delay the voice by
+seconds.)
+
+While a call is recorded, the agent's own voice is saved at each step of the
+live chain, each covering the same stretch, in a folder per call,
 `Recordings\Agent voice\<date time>\`:
 
-- `input.m4a`: the raw microphone, what the models get;
-- `audio_tse.m4a`: after WeSep (TSE);
-- `audio_tse_se.m4a`: after speech enhancement too, what the transcript gets;
+- `input.m4a`: the microphone;
+- `audio_tse.m4a`: after TSE (the microphone, until the chain has a TSE model);
+- `audio_tse_se.m4a`: after DeepFilterNet3 too: what the customer and the
+  transcript get;
 - `rtf.csv`: each step's real-time factor (time it took / length of the
-  audio; under 1 keeps up), for every 2 s block and for the whole call.
+  audio; under 1 keeps up), for every 2 s and for the whole call.
+
+The live stage hands a copy of every 10 ms it sends out to a separate
+thread below normal priority, without waiting; if that thread falls behind,
+copies are dropped, never the call's audio.
 
 They're written as WAV during the call and made M4A once it's over, so the
 encoding takes nothing from the call; where Windows can't encode M4A ("N"

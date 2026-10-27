@@ -10,6 +10,7 @@ pub mod ipc;
 pub mod playback;
 pub mod record;
 pub mod ring;
+pub mod stages;
 pub mod stream;
 pub mod transcribe;
 pub mod tse;

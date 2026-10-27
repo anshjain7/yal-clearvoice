@@ -22,6 +22,7 @@ use clearvoice::ipc::{self, TELEMETRY, UiCommand};
 use clearvoice::playback::Speaker;
 use clearvoice::record;
 use clearvoice::ring;
+use clearvoice::stages;
 use clearvoice::stream::{self, supervise};
 use clearvoice::transcribe::{self, Side};
 use clearvoice::tse;
@@ -240,6 +241,9 @@ fn main() {
     // the microphone dropping frames, and for the send path's cushion.
     let (mut raw_tx, mut raw_rx) = ring::new(16);
     let (mut clean_tx, mut clean_rx) = ring::new(16);
+    // Copies of what the live stage sends out, for the recorded call's stage
+    // files (stages.rs): 1.28 s of room before copies are dropped.
+    let (mut tap_tx, mut tap_rx) = ring::new(128);
     let (mic_stop, spk_stop, listen_stop, quit) = (
         AtomicBool::new(false),
         AtomicBool::new(false),
@@ -250,7 +254,11 @@ fn main() {
 
     thread::scope(|s| {
         let control = &control;
-        let df = s.spawn(move || denoise::run(models_rx, &mut raw_rx, &mut clean_tx, control));
+        let df = s.spawn(move || {
+            let tap = Some(&mut tap_tx);
+            denoise::run_tapped(models_rx, &mut raw_rx, &mut clean_tx, control, tap)
+        });
+        s.spawn(move || stages::run(&mut tap_rx, control, &control.stop, record::recording));
         let spk = s.spawn(|| {
             supervise(
                 &spk_stop,
@@ -292,30 +300,20 @@ fn main() {
                 },
             )
         });
-        // Both sides of the call, each recorded and relayed to Sarvam: the
-        // customer by loopback of the agent's headset; the agent from their raw
-        // microphone when WeSep runs on this PC (extraction, then speech
-        // enhancement, in voice.rs), else by loopback of VB-CABLE (their
-        // cleaned voice). Off the audio path: nothing here touches the rings.
+        // Both sides of the call, each recorded by loopback and relayed to
+        // Sarvam: the customer from the agent's headset, the agent from
+        // VB-CABLE, the voice the live chain sends the customer. Off the audio
+        // path: nothing here touches the rings.
         if let Some(settings) = &transcription {
             let listen_stop = &listen_stop;
             let customer = agent_speaker as fn() -> Option<String>;
-            let agent = match &voice_backend {
-                Some(voice::Backend::Local { .. }) => {
-                    (Direction::Input, mic_in_use as fn() -> Option<String>)
-                }
-                _ => (Direction::Output, cable_input as fn() -> Option<String>),
-            };
-            let sides = [
-                (Side::Customer, (Direction::Output, customer)),
-                (Side::Agent, agent),
-            ];
-            for (side, (direction, endpoint)) in sides {
+            for (side, endpoint) in [(Side::Customer, customer), (Side::Agent, cable_input)] {
                 let (tx, rx) = mpsc::channel();
-                s.spawn(move || transcribe::listen(direction, endpoint, tx, listen_stop));
-                // Only the agent's own voice, when there's a voice server.
+                s.spawn(move || transcribe::listen(Direction::Output, endpoint, tx, listen_stop));
+                // A voice server still cleans the agent's side for the
+                // transcript; on this PC, extraction moves into the live chain.
                 let rx = match (&voice_backend, side) {
-                    (Some(backend), Side::Agent) => {
+                    (Some(backend @ voice::Backend::Server(_)), Side::Agent) => {
                         let (clean_tx, clean_rx) = mpsc::channel();
                         s.spawn(move || voice::clean(backend, rx, clean_tx));
                         clean_rx

@@ -86,7 +86,7 @@ fn log_path(wav: &Path) -> PathBuf {
 static RECORDING: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// The call recording in progress (its .wav), if any.
-pub(crate) fn recording() -> Option<PathBuf> {
+pub fn recording() -> Option<PathBuf> {
     RECORDING.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
