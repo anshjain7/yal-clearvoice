@@ -245,7 +245,8 @@ fn main() {
         });
     }
     // Live TSE (livetse.rs): WeSep between the microphone and noise removal,
-    // switched on from the window to test it. Off at start.
+    // for the customer and the transcript. On at start; the window can
+    // switch it off.
     let live_setup = tse::Files::find(&exe_dir).map(|files| livetse::Setup {
         files,
         threads: livetse::threads(voice::local_options(&ini).1),
@@ -254,7 +255,7 @@ fn main() {
     let has_live = live_setup.is_some();
     TELEMETRY.live_tse.store(
         if has_live {
-            livetse::OFF
+            livetse::ON
         } else {
             livetse::UNAVAILABLE
         },
@@ -290,6 +291,7 @@ fn main() {
     );
     let control = Control::default();
     let live = livetse::Control::default();
+    live.enabled.store(has_live, Relaxed);
 
     thread::scope(|s| {
         let (control, live) = (&control, &live);

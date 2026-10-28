@@ -99,37 +99,37 @@ order (TSE as in `run_tse.sh`, then speech enhancement as in `run_se.sh`):
 
 What comes out goes to the calling app, so to the customer, and the
 transcript listens to it too, by loopback of VB-CABLE, like the customer's
-side from the headset. The TSE step needs a causal (live) target speaker
-model; until one ships, it passes the voice on unchanged, so the chain is
-DeepFilterNet3 alone. (WeSep's public model looks at audio after each
-moment as well as before, so it can't run live without delaying the voice
-by seconds.)
+side from the headset.
 
-To try today's WeSep on a call anyway, tick **Live voice filter (test)**
-(shown when the WeSep files ship with the engine; off at every start, and
-it asks first). The TSE step then runs WeSep on the microphone chunk by
-chunk, as the team's `run_tse.sh --chunk_sec 3.0 --overlap_sec 1.0`: 3 s
-chunks overlapping by 1 s, each sent to WeSep as soon as it's gathered, the
-overlapping second crossfaded from one chunk's output to the next. Then
-DeepFilterNet3 does speech enhancement, as `run_se.sh` (MossFormer2 is too
-heavy for the agents' laptops). The result plays 5 s behind: the customer
-hears the agent 5 s late (2 s of new audio per chunk, up to 2 s for WeSep,
-and 1 s held back for the crossfade). A chunk WeSep hasn't finished by then
-goes out as recorded (the window shows "PC too slow"), and the delay stays
-5 s; one it fails on, as recorded. Unticking it goes back to
-the normal chain at once. WeSep gets half the PC's logical processors, 2 to
-4 (or `[voice] threads`, if more). On the development PC (i5-12450H, on
-battery, with DeepFilterNet3 running too) its real-time factor was 0.50 at
-4 threads and 0.66 at 2, but swung up to 1.2 at times on battery: then it
-falls behind.
+The TSE step is WeSep, on by default (the window's **Voice filter (WeSep)**
+box, shown when the WeSep files ship with the engine, switches it off and
+on). WeSep's public model looks at audio after each moment as well as
+before, so it can't work moment by moment: the step runs it on the
+microphone chunk by chunk, as the team's `run_tse.sh --chunk_sec 1.5
+--overlap_sec 0.5`: 1.5 s chunks overlapping by 0.5 s, each sent to WeSep
+as soon as it's gathered, the overlapping half second crossfaded from one
+chunk's output to the next. Then DeepFilterNet3 does speech enhancement, as
+`run_se.sh` (MossFormer2 is too heavy for the agents' laptops). The result
+plays 3 s behind: the customer hears the agent 3 s late (1 s of new audio
+per chunk, up to 1.5 s for WeSep, and 0.5 s held back for the crossfade).
+Shorter chunks separate less (2 s pieces barely did); a causal (live)
+target speaker model would take WeSep's place with about 30 ms of delay
+(docs/causal-tse-training.md).
+
+A chunk WeSep hasn't finished in time goes out as recorded (the window
+shows "PC too slow"), and the delay stays 3 s; when WeSep falls behind it
+skips chunks already past their time to catch up. One it fails on (no voice
+sample, say) goes out as recorded too. Unticking the box goes back to
+DeepFilterNet3 alone at once. WeSep gets half the PC's logical processors,
+2 to 4 (or `[voice] threads`, if more).
 
 While a call is recorded, the agent's own voice is saved at each step of the
 live chain, each covering the same stretch, in a folder per call,
 `Recordings\Agent voice\<date time>\`:
 
 - `input.m4a`: the microphone;
-- `audio_tse.m4a`: after TSE (the microphone, while the live voice filter
-  is off; with it on, WeSep's output, lined up with `input`);
+- `audio_tse.m4a`: after TSE (WeSep's output, lined up with `input`; the
+  microphone as it was while the voice filter is off);
 - `audio_tse_se.m4a`: after DeepFilterNet3 too: what the customer and the
   transcript get;
 - `rtf.csv`: each step's real-time factor (time it took / length of the
@@ -166,7 +166,7 @@ and the engine replies with one JSON line. No audio crosses the pipe.
 | `poll` | telemetry |
 | `list` | device list |
 | `nc on` / `nc off` | telemetry |
-| `tse on` / `tse off` | telemetry; the live voice filter (test) |
+| `tse on` / `tse off` | telemetry; the voice filter (WeSep), on at start |
 | `mic <id>` / `mic default` | telemetry |
 | `spk <id>` / `spk default` | telemetry |
 | `strength <0-100>` | telemetry (accepted, but has no effect until the engine exposes the attenuation limit) |
@@ -191,7 +191,7 @@ Telemetry:
  "mic_name":"Microphone (Detecta 201 USB)","headset_name":"Speakers (Detecta 201 USB)"}
 ```
 
-Newer engines add `voice` and `live_tse` (the live voice filter: `off`,
+Newer engines add `voice` and `live_tse` (the voice filter, WeSep: `off`,
 `on`, `late`, `failed`, or `unavailable` without the WeSep files).
 
 `notice` codes:

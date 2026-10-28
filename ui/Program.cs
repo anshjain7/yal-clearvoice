@@ -106,12 +106,13 @@ sealed class MainForm : Form
     readonly CheckBox _nc = new() { Text = "Noise cancellation", AutoSize = true };
     // WeSep on the live call, before noise removal (a test: the agent's voice
     // reaches the customer seconds late). Shown when the engine has WeSep.
-    readonly CheckBox _liveTse = new() { Text = "Live voice filter (test)", AutoSize = true, Visible = false };
+    readonly CheckBox _liveTse = new() { Text = "Voice filter (WeSep)", AutoSize = true, Visible = false };
     readonly Label _liveTseStatus = new() { AutoSize = true, ForeColor = Muted };
-    // The agent's choice (UI thread). Kept apart from the box: the engine's
+    // The agent's choice (UI thread; null until the engine first reports, then
+    // the engine's own, on by default). Kept apart from the box: the engine's
     // status mustn't untick it while the warning is open, and the switch is
-    // sent again if the engine reports it off (restarted, or not there yet).
-    bool _liveTseWanted;
+    // sent again if the engine reports otherwise (restarted, or not there yet).
+    bool? _liveTseWanted;
     readonly Label _headset = new();
     readonly Label _conn = new();
     readonly Label _dfn = new();
@@ -198,7 +199,7 @@ sealed class MainForm : Form
         _liveTse.CheckedChanged += (_, _) =>
         {
             if (_loading) return;
-            if (_liveTse.Checked && MessageBox.Show(this, LiveTsePrompt, "Live voice filter (test)",
+            if (_liveTse.Checked && MessageBox.Show(this, LiveTsePrompt, "Voice filter (WeSep)",
                     MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK)
             {
                 _loading = true;
@@ -207,7 +208,7 @@ sealed class MainForm : Form
                 return;
             }
             _liveTseWanted = _liveTse.Checked;
-            _commands.Enqueue(_liveTseWanted ? "tse on" : "tse off");
+            _commands.Enqueue(_liveTse.Checked ? "tse on" : "tse off");
         };
         // The agent starts and stops transcription. Stopping ends the call, and
         // the worker then writes its summary.
@@ -311,10 +312,9 @@ sealed class MainForm : Form
         + "only to recognise your voice in transcripts. You can register again at any time.";
 
     const string LiveTsePrompt =
-        "This is a test. It runs the voice filter (WeSep) on your microphone during the "
-        + "call, before noise removal, so the customer hears only your registered voice.\n\n"
-        + "Your voice will reach the customer about 5 seconds late. Use it only on test "
-        + "calls, not with real customers.\n\n"
+        "The voice filter (WeSep) keeps only your registered voice, for the customer and "
+        + "the transcript, and removes other people's.\n\n"
+        + "Your voice reaches the customer about 3 seconds late while it's on.\n\n"
         + "If your PC can't keep up, your voice goes out unfiltered for those moments. Untick it to "
         + "go back to normal at once.";
 
@@ -743,8 +743,15 @@ sealed class MainForm : Form
             _latency.Text = latency > 0 ? $"{latency} ms" : "—";
             _nc.Checked = nc;
             _liveTse.Visible = liveTse != "unavailable";
-            if (_liveTseWanted && liveTse == "off") _commands.Enqueue("tse on");
-            _liveTseStatus.Text = _liveTseWanted && liveTse == "off" ? "Starting…" : liveText;
+            if (_liveTseWanted is null && liveTse != "unavailable")
+            {
+                _liveTseWanted = liveTse != "off";
+                _liveTse.Checked = _liveTseWanted.Value;
+            }
+            bool engineOn = liveTse != "off" && liveTse != "unavailable";
+            if (_liveTseWanted is bool want && liveTse != "unavailable" && want != engineOn)
+                _commands.Enqueue(want ? "tse on" : "tse off");
+            _liveTseStatus.Text = _liveTseWanted == true && liveTse == "off" ? "Starting…" : liveText;
             _liveTseStatus.ForeColor = liveColor;
             if (!spkSelectable && !_spkLocked)
             {
