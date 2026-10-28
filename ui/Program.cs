@@ -104,6 +104,15 @@ sealed class MainForm : Form
     readonly ComboBox _mic = new() { DropDownStyle = ComboBoxStyle.DropDownList };
     readonly ComboBox _spk = new() { DropDownStyle = ComboBoxStyle.DropDownList };
     readonly CheckBox _nc = new() { Text = "Noise cancellation", AutoSize = true };
+    // WeSep on the live call, before noise removal (a test: the agent's voice
+    // reaches the customer seconds late). Shown when the engine has WeSep.
+    readonly CheckBox _liveTse = new() { Text = "Voice filter (WeSep)", AutoSize = true, Visible = false };
+    readonly Label _liveTseStatus = new() { AutoSize = true, ForeColor = Muted };
+    // The agent's choice (UI thread; null until the engine first reports, then
+    // the engine's own, on by default). Kept apart from the box: the engine's
+    // status mustn't untick it while the warning is open, and the switch is
+    // sent again if the engine reports otherwise (restarted, or not there yet).
+    bool? _liveTseWanted;
     readonly Label _headset = new();
     readonly Label _conn = new();
     readonly Label _dfn = new();
@@ -158,6 +167,11 @@ sealed class MainForm : Form
     string _deviceKey = ""; // the device list the pickers show (worker thread)
     int _summarizedCall;
     volatile bool _summarizing;
+    // Finished calls, by id: when each began and ended, for an improved
+    // transcript that comes after the call (worker thread). And the last call
+    // summarized again from one.
+    readonly Dictionary<int, (DateTime Start, DateTime End)> _ended = new();
+    int _improvedCall;
 
     public MainForm()
     {
@@ -181,6 +195,20 @@ sealed class MainForm : Form
         _nc.CheckedChanged += (_, _) =>
         {
             if (!_loading) _commands.Enqueue(_nc.Checked ? "nc on" : "nc off");
+        };
+        _liveTse.CheckedChanged += (_, _) =>
+        {
+            if (_loading) return;
+            if (_liveTse.Checked && MessageBox.Show(this, LiveTsePrompt(_liveTseDelayMs), "Voice filter (WeSep)",
+                    MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK)
+            {
+                _loading = true;
+                _liveTse.Checked = false;
+                _loading = false;
+                return;
+            }
+            _liveTseWanted = _liveTse.Checked;
+            _commands.Enqueue(_liveTse.Checked ? "tse on" : "tse off");
         };
         // The agent starts and stops transcription. Stopping ends the call, and
         // the worker then writes its summary.
@@ -283,6 +311,17 @@ sealed class MainForm : Form
         + "Your voice sample is kept on this PC, for your Windows account only, and used "
         + "only to recognise your voice in transcripts. You can register again at any time.";
 
+    // How far behind the microphone the voice filter plays (UI thread; from
+    // the engine: about 0.7 s with a voice server, 3 s on this PC).
+    long _liveTseDelayMs = 3000;
+
+    static string LiveTsePrompt(long delayMs) =>
+        "The voice filter (WeSep) keeps only your registered voice, for the customer and "
+        + "the transcript, and removes other people's.\n\n"
+        + $"Your voice reaches the customer about {delayMs / 1000.0:0.#} seconds late while it's on.\n\n"
+        + "If it can't keep up, your voice goes out unfiltered for those moments. Untick it to "
+        + "go back to normal at once.";
+
     const string UploadPrompt =
         "Instead of recording now, you can use a recording of your voice that you already "
         + "have, for example a WAV or MP3 file on your Desktop.\n\n"
@@ -295,9 +334,9 @@ sealed class MainForm : Form
     const string RecordConsent =
         "YAL ClearVoice will record each call you transcribe while \"Record call audio\" "
         + "is ticked, from Start to Stop, as one audio file with both you and the customer. "
-        + "Your own side is also saved twice in the \"Agent voice\" folder: as your "
-        + "microphone heard it (noisy), and cleaned, with other people's voices and noise "
-        + "removed.\n\n"
+        + "Your own side is also saved in the \"Agent voice\" folder at each step: as your "
+        + "microphone heard it (input), after the voice filter (audio_tse), and with noise "
+        + "removed too, as the customer heard it (audio_tse_se).\n\n"
         + "Only record calls where the customer has been told the call may be recorded.\n\n"
         + "Recordings stay on this PC (\"Open recordings\" shows them). Nothing is "
         + "uploaded or sent anywhere.\n\n"
@@ -377,6 +416,10 @@ sealed class MainForm : Form
         _nc.Location = new Point(16, y);
         _nc.ForeColor = Teal;
         Controls.Add(_nc);
+        _liveTse.Location = new Point(176, y);
+        Controls.Add(_liveTse);
+        _liveTseStatus.Location = new Point(340, y + 2);
+        Controls.Add(_liveTseStatus);
         y += 36;
 
         Header("Status");
@@ -633,6 +676,16 @@ sealed class MainForm : Form
         string micName = r.TryGetValue("mic_name", out var mn) ? mn as string ?? "" : "";
         string headsetName = r.TryGetValue("headset_name", out var hn) ? hn as string ?? "" : "";
         string voice = r.TryGetValue("voice", out var vo) ? vo as string ?? "off" : "off";
+        string liveTse = r.TryGetValue("live_tse", out var lt) ? lt as string ?? "unavailable" : "unavailable";
+        var (liveText, liveColor) = liveTse switch
+        {
+            "on" => ("On", Teal),
+            "late" => ("PC too slow", Ink),
+            "failed" => ("Error", Ink),
+            "server_down" => ("Server not reachable", Ink),
+            _ => ("", Muted),
+        };
+        long liveDelay = r.TryGetValue("live_tse_delay_ms", out var ld) ? Convert.ToInt64(ld) : 0;
         var (voiceText, voiceColor) = voice switch
         {
             "no_sample" => ("Not registered yet", Ink),
@@ -695,6 +748,18 @@ sealed class MainForm : Form
             _headset.ForeColor = headsetName.Length > 0 ? Ink : Muted;
             _latency.Text = latency > 0 ? $"{latency} ms" : "—";
             _nc.Checked = nc;
+            _liveTse.Visible = liveTse != "unavailable";
+            if (liveDelay > 0) _liveTseDelayMs = liveDelay;
+            if (_liveTseWanted is null && liveTse != "unavailable")
+            {
+                _liveTseWanted = liveTse != "off";
+                _liveTse.Checked = _liveTseWanted.Value;
+            }
+            bool engineOn = liveTse != "off" && liveTse != "unavailable";
+            if (_liveTseWanted is bool want && liveTse != "unavailable" && want != engineOn)
+                _commands.Enqueue(want ? "tse on" : "tse off");
+            _liveTseStatus.Text = _liveTseWanted == true && liveTse == "off" ? "Starting…" : liveText;
+            _liveTseStatus.ForeColor = liveColor;
             if (!spkSelectable && !_spkLocked)
             {
                 _spk.Items.Clear();
@@ -745,7 +810,44 @@ sealed class MainForm : Form
         if (!active && _lines.Count > 0 && !_summarizing && _summarizedCall != call)
         {
             _summarizedCall = call;
-            StartSummary(new List<string>(_lines), _callStart, _saveCalls);
+            StartSummary(call, new List<string>(_lines), _callStart, _saveCalls);
+        }
+
+        // After a recorded call, the engine's after-call pass may send that
+        // call's improved transcript, minutes later: it replaces the call's
+        // note and saved copy, and the window's view if it still shows it.
+        if (t.TryGetValue("improved", out var imp) && imp is Dictionary<string, object> improved)
+        {
+            int which = Convert.ToInt32(improved["call"]);
+            if (which != _improvedCall && !_summarizing && _ended.TryGetValue(which, out var when))
+            {
+                _improvedCall = which;
+                var better = new List<string>();
+                var shown = new List<KeyValuePair<bool, string>>();
+                foreach (Dictionary<string, object> l in (IEnumerable)improved["lines"])
+                {
+                    bool customer = "customer".Equals(l["who"]);
+                    string text = l["text"] as string ?? "";
+                    better.Add((customer ? "Customer: " : "Agent: ") + text);
+                    shown.Add(new(customer, text));
+                }
+                if (better.Count > 0)
+                {
+                    if (which == call && !active)
+                    {
+                        _lines.Clear();
+                        _lines.AddRange(better);
+                        RunOnUi(() =>
+                        {
+                            _transcript.Clear();
+                            _transcript.SelectionColor = Muted;
+                            _transcript.AppendText("Improved after the call (voice filter on the whole call):\n");
+                            foreach (var a in shown) AppendLine(a.Key, a.Value);
+                        });
+                    }
+                    StartSummary(which, better, when.Start, _saveCalls, when.End);
+                }
+            }
         }
 
         // A recording follows the transcribed call while wanted: one file per call.
@@ -828,29 +930,40 @@ sealed class MainForm : Form
     // The server's context is ~10k tokens: a very long call keeps its start and end.
     const int MaxTranscriptChars = 16000;
 
-    // Summarizes a finished call (its `lines`, begun at `start`). A summary that
-    // came is saved as a note in the summary notes folder. With `save`, the call
-    // is also kept for Previous calls: at once with the transcript, so it's kept
-    // even if the summary never comes, then again with the summary.
-    void StartSummary(List<string> lines, DateTime start, bool save)
+    // Summarizes finished call `call` (its `lines`, begun at `start`). A summary
+    // that came is saved as a note in the summary notes folder. With `save`, the
+    // call is also kept for Previous calls: at once with the transcript, so it's
+    // kept even if the summary never comes, then again with the summary.
+    // `improvedEnd` marks a second summary, from the after-call pass's improved
+    // transcript: it keeps the call's times, replaces its note and saved copy
+    // only when it came, and shows only if the window still shows that call.
+    void StartSummary(int call, List<string> lines, DateTime start, bool save, DateTime? improvedEnd = null)
     {
         _summarizing = true;
-        var end = DateTime.Now;
-        if (save) CallStore.Save(start, end, "(not written yet)", lines);
-        RunOnUi(() => _summary.Text = "Writing the summary…");
+        bool improved = improvedEnd is not null;
+        var end = improvedEnd ?? DateTime.Now;
+        if (!improved)
+        {
+            _ended[call] = (start, end);
+            if (save) CallStore.Save(start, end, "(not written yet)", lines);
+            RunOnUi(() => _summary.Text = "Writing the summary…");
+        }
         new Thread(() =>
         {
             string text;
             bool ok;
             try { text = Summarize(string.Join("\n", lines), out ok); }
             finally { _summarizing = false; }
+            if (improved && !ok) return; // the first summary stays
             string? note = null;
             if (ok)
             {
                 try
                 {
                     Notes.Save(start, end, text);
-                    note = $"Note saved at {DateTime.Now:HH:mm}";
+                    note = improved
+                        ? $"Note improved at {DateTime.Now:HH:mm}"
+                        : $"Note saved at {DateTime.Now:HH:mm}";
                 }
                 catch (Exception e)
                 {
@@ -861,11 +974,12 @@ sealed class MainForm : Form
                 text += $"\r\n\r\n(This call couldn't be saved: {error})";
             RunOnUi(() =>
             {
-                _summary.Text = text;
+                if (improved && call != _callId) return;
+                _summary.Text = improved ? "Improved after the call:\r\n" + text : text;
                 if (note is not null)
                 {
                     _noteStatus.Text = note;
-                    _noteStatus.ForeColor = note.StartsWith("Note saved") ? Teal : Ink;
+                    _noteStatus.ForeColor = note.StartsWith("Note ") ? Teal : Ink;
                 }
             });
         }) { IsBackground = true }.Start();

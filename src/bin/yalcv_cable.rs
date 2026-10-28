@@ -15,13 +15,18 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use clearvoice::aftercall;
 use clearvoice::capture::Mic;
 use clearvoice::denoise::{self, Control, DeepFilter};
 use clearvoice::devices::{self, Device, Direction, SelectError};
 use clearvoice::ipc::{self, TELEMETRY, UiCommand};
+use clearvoice::livetse;
 use clearvoice::playback::Speaker;
 use clearvoice::record;
+use clearvoice::remote_tse;
 use clearvoice::ring;
+use clearvoice::sliding;
+use clearvoice::stages;
 use clearvoice::stream::{self, supervise};
 use clearvoice::transcribe::{self, Side};
 use clearvoice::tse;
@@ -225,6 +230,51 @@ fn main() {
         }),
     };
     voice::set_state(voice::initial_state(voice_backend.is_some()));
+    // After a recorded call: WeSep and speech enhancement on the whole of the
+    // agent's side, then an improved transcript through Sarvam (aftercall.rs),
+    // unless settings.ini turns it off.
+    if let Some(files) = tse::Files::find(&exe_dir)
+        && aftercall::enabled(&ini)
+    {
+        let (_, threads) = voice::local_options(&ini);
+        aftercall::configure(aftercall::Config {
+            files,
+            threads,
+            sample: voice::sample_path(),
+            dfn3: beside_exe("DeepFilterNet3_onnx.tar.gz"),
+            attenuation,
+            sarvam: transcription.clone(),
+        });
+    }
+    // Live TSE (livetse.rs): WeSep between the microphone and noise removal,
+    // for the customer and the transcript, on a GPU voice server when there's
+    // one (remote_tse.rs), else on this PC. On at start; the window can
+    // switch it off.
+    let remote = remote_tse::Settings::parse(&ini);
+    let files = tse::Files::find(&exe_dir);
+    let (remix, threads) = voice::local_options(&ini);
+    let live_setup = (files.is_some() || remote.is_some()).then(|| livetse::Setup {
+        files,
+        threads: livetse::threads(threads),
+        sample: voice::sample_path(),
+        remote: remote.clone(),
+        window: sliding::Window::parse(&ini, livetse::CPU_BUDGET_MS),
+        remix,
+    });
+    let has_live = live_setup.is_some();
+    if let Some(setup) = &live_setup {
+        TELEMETRY
+            .live_tse_delay_ms
+            .store(setup.delay_frames() as u64 * 10, Relaxed);
+    }
+    TELEMETRY.live_tse.store(
+        if has_live {
+            livetse::ON
+        } else {
+            livetse::UNAVAILABLE
+        },
+        Relaxed,
+    );
 
     if !headless {
         println!("YAL ClearVoice is running.");
@@ -240,6 +290,13 @@ fn main() {
     // the microphone dropping frames, and for the send path's cushion.
     let (mut raw_tx, mut raw_rx) = ring::new(16);
     let (mut clean_tx, mut clean_rx) = ring::new(16);
+    // Copies of what the live stage sends out, for the recorded call's stage
+    // files (stages.rs): 1.28 s of room before copies are dropped.
+    let (mut tap_tx, mut tap_rx) = ring::new(128);
+    // With live TSE: what it sends noise removal, and its own copies (the
+    // microphone each frame came from) for the stage files.
+    let (mut mid_tx, mut mid_rx) = ring::new(16);
+    let (mut live_tap_tx, mut live_tap_rx) = ring::new(128);
     let (mic_stop, spk_stop, listen_stop, quit) = (
         AtomicBool::new(false),
         AtomicBool::new(false),
@@ -247,10 +304,36 @@ fn main() {
         AtomicBool::new(false),
     );
     let control = Control::default();
+    let live = livetse::Control::default();
+    live.enabled.store(has_live, Relaxed);
 
     thread::scope(|s| {
-        let control = &control;
-        let df = s.spawn(move || denoise::run(models_rx, &mut raw_rx, &mut clean_tx, control));
+        let (control, live) = (&control, &live);
+        let df_in = match live_setup {
+            Some(setup) => {
+                let (input, output, tap) = (&mut raw_rx, &mut mid_tx, &mut live_tap_tx);
+                s.spawn(move || livetse::run(input, output, Some(tap), live, setup));
+                &mut mid_rx
+            }
+            None => &mut raw_rx,
+        };
+        let df = s.spawn(move || {
+            let tap = Some(&mut tap_tx);
+            denoise::run_tapped(models_rx, df_in, &mut clean_tx, control, tap)
+        });
+        let live_tap = has_live.then_some(stages::LiveTse {
+            tap: &mut live_tap_rx,
+            control: live,
+        });
+        s.spawn(move || {
+            stages::run(
+                &mut tap_rx,
+                control,
+                live_tap,
+                &control.stop,
+                record::recording,
+            )
+        });
         let spk = s.spawn(|| {
             supervise(
                 &spk_stop,
@@ -292,30 +375,23 @@ fn main() {
                 },
             )
         });
-        // Both sides of the call, each recorded and relayed to Sarvam: the
-        // customer by loopback of the agent's headset; the agent from their raw
-        // microphone when WeSep runs on this PC (extraction, then speech
-        // enhancement, in voice.rs), else by loopback of VB-CABLE (their
-        // cleaned voice). Off the audio path: nothing here touches the rings.
+        // Both sides of the call, each recorded by loopback and relayed to
+        // Sarvam: the customer from the agent's headset, the agent from
+        // VB-CABLE, the voice the live chain sends the customer. Off the audio
+        // path: nothing here touches the rings.
         if let Some(settings) = &transcription {
             let listen_stop = &listen_stop;
             let customer = agent_speaker as fn() -> Option<String>;
-            let agent = match &voice_backend {
-                Some(voice::Backend::Local { .. }) => {
-                    (Direction::Input, mic_in_use as fn() -> Option<String>)
-                }
-                _ => (Direction::Output, cable_input as fn() -> Option<String>),
-            };
-            let sides = [
-                (Side::Customer, (Direction::Output, customer)),
-                (Side::Agent, agent),
-            ];
-            for (side, (direction, endpoint)) in sides {
+            for (side, endpoint) in [(Side::Customer, customer), (Side::Agent, cable_input)] {
                 let (tx, rx) = mpsc::channel();
-                s.spawn(move || transcribe::listen(direction, endpoint, tx, listen_stop));
-                // Only the agent's own voice, when there's a voice server.
+                s.spawn(move || transcribe::listen(Direction::Output, endpoint, tx, listen_stop));
+                // A voice server not streaming still cleans the agent's side
+                // for the transcript; streaming, or on this PC, extraction is
+                // in the live chain the transcript listens to.
                 let rx = match (&voice_backend, side) {
-                    (Some(backend), Side::Agent) => {
+                    (Some(backend @ voice::Backend::Server(_)), Side::Agent)
+                        if remote.is_none() =>
+                    {
                         let (clean_tx, clean_rx) = mpsc::channel();
                         s.spawn(move || voice::clean(backend, rx, clean_tx));
                         clean_rx
@@ -348,6 +424,7 @@ fn main() {
             for c in cmd_rx.try_iter() {
                 match c {
                     UiCommand::Nc(on) => control.enabled.store(on, Relaxed),
+                    UiCommand::LiveTse(on) => live.enabled.store(on && has_live, Relaxed),
                     UiCommand::SetMic(id) => {
                         *requested_mic.lock().unwrap() = id;
                         mic_reopen.store(true, Relaxed);
@@ -403,6 +480,7 @@ fn main() {
         listen_stop.store(true, Relaxed);
         spk_stop.store(true, Relaxed);
         control.stop.store(true, Relaxed);
+        live.stop.store(true, Relaxed);
         mic_stop.store(true, Relaxed);
         let _ = (mic.join(), df.join(), spk.join());
     });

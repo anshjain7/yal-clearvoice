@@ -86,19 +86,17 @@ fn log_path(wav: &Path) -> PathBuf {
 static RECORDING: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// The call recording in progress (its .wav), if any.
-pub(crate) fn recording() -> Option<PathBuf> {
+pub fn recording() -> Option<PathBuf> {
     RECORDING.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// Where the agent's own voice goes for the recording `wav`, in an "Agent
-/// voice" folder beside it: before the models (the raw microphone) and after
-/// them (speaker extraction and speech enhancement, what the transcript
-/// gets). `Recordings\2026-10-14 10-32-05.wav` ->
-/// `Recordings\Agent voice\2026-10-14 10-32-05 noisy.wav`, `... cleaned.wav`.
-pub(crate) fn agent_voice_path(wav: &Path, which: &str) -> PathBuf {
-    let stem = wav.file_stem().unwrap_or_default().to_string_lossy();
-    wav.with_file_name("Agent voice")
-        .join(format!("{stem} {which}.wav"))
+/// Where the agent's own voice goes for the recording `wav`, stage by stage
+/// (voice.rs): a folder of its own in "Agent voice" beside it.
+/// `Recordings\2026-10-14 10-32-05.wav` ->
+/// `Recordings\Agent voice\2026-10-14 10-32-05\`.
+pub(crate) fn agent_voice_dir(wav: &Path) -> PathBuf {
+    let stem = wav.file_stem().unwrap_or_default();
+    wav.with_file_name("Agent voice").join(stem)
 }
 
 /// A side to record: its name, and the device it comes from, if found.
@@ -389,6 +387,13 @@ pub(crate) fn write_wav(path: &Path, samples: &[i16]) -> io::Result<()> {
     wav.patch()
 }
 
+/// 16 kHz mono `samples` as a WAV file's bytes, in memory.
+pub(crate) fn wav_bytes(samples: &[i16]) -> Vec<u8> {
+    let mut b = header(samples.len() as u64).to_vec();
+    b.extend(samples.iter().flat_map(|s| s.to_le_bytes()));
+    b
+}
+
 /// A 16 kHz mono 16-bit WAV file being written. Its header is rewritten every
 /// 5 s, so a recording cut off by a crash or power cut still plays.
 pub(crate) struct Wav {
@@ -510,14 +515,9 @@ mod tests {
 
     #[test]
     fn agent_voice_goes_in_its_own_folder() {
-        let wav = Path::new(r"C:\Rec\2026-10-14 10-32-05.wav");
         assert_eq!(
-            agent_voice_path(wav, "noisy"),
-            Path::new(r"C:\Rec\Agent voice\2026-10-14 10-32-05 noisy.wav")
-        );
-        assert_eq!(
-            agent_voice_path(wav, "cleaned"),
-            Path::new(r"C:\Rec\Agent voice\2026-10-14 10-32-05 cleaned.wav")
+            agent_voice_dir(Path::new(r"C:\Rec\2026-10-14 10-32-05.wav")),
+            Path::new(r"C:\Rec\Agent voice\2026-10-14 10-32-05")
         );
     }
 

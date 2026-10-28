@@ -31,6 +31,7 @@ const HOP: usize = 128;
 const BINS: usize = WIN / 2 + 1;
 
 /// The files extraction needs, next to the engine.
+#[derive(Clone)]
 pub struct Files {
     pub runtime: PathBuf,
     pub speaker: PathBuf,
@@ -328,6 +329,41 @@ mod tests {
                     + 0.1 * (std::f64::consts::TAU * 1234.0 * t).sin()) as f32
             })
             .collect()
+    }
+
+    /// How long WeSep takes per window length on this PC (for a streaming
+    /// stage's hop): YAL_TSE_TIMING="<dir with onnxruntime.dll and wesep\>",
+    /// YAL_TSE_THREADS (default 4).
+    /// cargo test --release wesep_time_per_window -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs the WeSep files"]
+    fn wesep_time_per_window() {
+        let dir = std::env::var("YAL_TSE_TIMING").expect("set YAL_TSE_TIMING");
+        let threads = std::env::var("YAL_TSE_THREADS").map_or(4, |t| t.parse().unwrap());
+        let files = Files::find(Path::new(&dir)).expect("WeSep files");
+        let mut m = Extractor::load(&files, threads).unwrap();
+        // Speech-like noise: the time doesn't depend on what's said.
+        let mut seed = 1u32;
+        let mut noise = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (seed >> 8) as f32 / (1u32 << 24) as f32 * 0.2 - 0.1
+                })
+                .collect()
+        };
+        let emb = m.enroll(&noise(RATE * 5)).unwrap();
+        m.extract(&emb, &noise(RATE)).unwrap();
+        for secs in [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5] {
+            let x = noise((secs * RATE as f64) as usize);
+            let runs = 5;
+            let t = std::time::Instant::now();
+            for _ in 0..runs {
+                m.extract(&emb, &x).unwrap();
+            }
+            let ms = t.elapsed().as_secs_f64() * 1000.0 / runs as f64;
+            println!("window {secs:.1} s: {ms:6.0} ms per run ({threads} threads)");
+        }
     }
 
     #[test]

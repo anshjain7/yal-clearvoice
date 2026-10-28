@@ -1,31 +1,16 @@
-//! The agent's own voice, kept apart from voices nearby, for the transcript.
+//! The agent's own voice, kept apart from voices nearby.
 //!
 //! In an office the background is mostly other agents talking, which noise
-//! removal keeps (it's speech) and Sarvam then writes down as the agent. So
-//! the agent's side of a transcribed call goes through target speaker
-//! extraction (WeSep, with the agent's voice sample as the enrollment): on
-//! this PC (tse.rs) when the WeSep files ship with the engine, or on a
-//! `[voice]` server from settings.ini. Only the transcript is affected; the
-//! call itself still gets the voice straight from noise removal.
+//! removal keeps (it's speech). Target speaker extraction (TSE: WeSep, with
+//! the agent's voice sample as the enrollment) keeps only the agent.
 //!
-//! On this PC it follows the team's configuration:
-//!
-//!   run_tse.sh --enroll <voice sample> --input <microphone>
-//!   run_se.sh <that> <transcript>
-//!
-//! WeSep works on the raw microphone (before any noise removal), on every
-//! 2 s of it one after another (no overlapping chunks), with nothing of the
-//! original mixed back in; then speech enhancement (enhance.rs,
-//! DeepFilterNet3) cleans the result. So the agent's lines reach the
-//! transcript a few seconds later. (A `[voice]` server instead works on the
-//! call's cleaned voice, as before.)
-//!
-//! On this PC it stays out of the call's way: it runs on its own thread below
-//! normal priority (noise removal and the audio threads run at Pro Audio
-//! priority above it). It extracts every block, whatever the PC's speed: on
-//! a PC slower than WeSep needs, the transcript falls further behind the
-//! call as it goes on. Only when extraction fails is the agent's voice
-//! transcribed without it (still enhanced).
+//! On this PC the agent's voice goes through one live chain (denoise.rs,
+//! stages.rs): microphone, TSE, then speech enhancement, out to VB-CABLE, the
+//! customer and the transcript. WeSep's public model can't be that live TSE:
+//! it looks at audio after each moment too, so it would hold the voice back
+//! by seconds. Its files (tse.rs) stay for work that can wait, such as a
+//! whole recording after the call; `clean` here runs only for a `[voice]`
+//! server, which cleans the agent's side for the transcript during the call.
 //!
 //! The voice sample is 20 s of the agent speaking, recorded once from the
 //! cleaned voice (the same sound extraction later works on) and kept in
@@ -242,13 +227,6 @@ pub fn clean(backend: &Backend, input: Receiver<Vec<i16>>, out: Sender<Vec<i16>>
     };
     let mut blocks = Blocks::default();
     let mut off_until: Option<Instant> = None;
-    // While the call is also being recorded: the agent's voice before and
-    // after the models, saved beside it. Before only on this PC, where the
-    // input is the raw microphone (a server gets the call's cleaned voice).
-    let mut savers = Savers {
-        noisy: matches!(engine, Engine::Local(_)).then(|| Saver::new("noisy")),
-        cleaned: Saver::new("cleaned"),
-    };
     for chunk in input {
         let calling = transcribe::active();
         let on =
@@ -260,13 +238,13 @@ pub fn clean(backend: &Backend, input: Receiver<Vec<i16>>, out: Sender<Vec<i16>>
             // Speech enhancement only during a call: between calls nothing is
             // transcribed, and it would keep a core busy for nothing.
             let enhance = enhancer.as_mut().filter(|_| calling);
-            send(&audio, &audio, enhance, &mut savers, &out);
+            send(&audio, enhance, &out);
             continue;
         }
         let Some(block) = blocks.push(&chunk) else {
             continue;
         };
-        let cleaned = match engine.extract(&block) {
+        let tse = match engine.extract(&block) {
             Ok(cleaned) => {
                 set_state(ipc::VOICE_READY);
                 off_until = None;
@@ -275,84 +253,24 @@ pub fn clean(backend: &Backend, input: Receiver<Vec<i16>>, out: Sender<Vec<i16>>
             Err(_) => {
                 set_state(engine.failed_state());
                 off_until = Some(Instant::now() + OFF_AFTER_FAILURE);
-                block.clone()
+                block
             }
         };
-        send(&block, &cleaned, enhancer.as_mut(), &mut savers, &out);
+        send(&tse, enhancer.as_mut(), &out);
     }
-    let rest = blocks.flush();
-    send(&rest, &rest, enhancer.as_mut(), &mut savers, &out);
-    if let Some(noisy) = &mut savers.noisy {
-        noisy.save(None, &[]);
-    }
-    savers.cleaned.save(None, &[]);
+    send(&blocks.flush(), enhancer.as_mut(), &out);
 }
 
-/// Hands cleaned audio on: through speech enhancement (`enhancer`, when
-/// there is one), to the relay. While a call is being recorded, `raw` (what
-/// the models got) and the result go to the agent's voice files.
-fn send(
-    raw: &[i16],
-    cleaned: &[i16],
-    enhancer: Option<&mut Enhancer>,
-    savers: &mut Savers,
-    out: &Sender<Vec<i16>>,
-) {
+/// Hands the agent's voice on: `tse` (after TSE, or as it was when TSE
+/// didn't run) through speech enhancement (`enhancer`, when there is one) to
+/// the relay.
+fn send(tse: &[i16], enhancer: Option<&mut Enhancer>, out: &Sender<Vec<i16>>) {
     let audio = match enhancer {
-        Some(e) => e.process(cleaned),
-        None => cleaned.to_vec(),
+        Some(e) => e.process(tse),
+        None => tse.to_vec(),
     };
-    let recording = record::recording();
-    if let Some(noisy) = &mut savers.noisy {
-        noisy.save(recording.clone(), raw);
-    }
     for c in audio.chunks(CHUNK) {
-        savers.cleaned.save(recording.clone(), c);
         let _ = out.send(c.to_vec());
-    }
-}
-
-/// The agent's voice files for the call being recorded.
-struct Savers {
-    /// Before the models; None when the input isn't the raw microphone.
-    noisy: Option<Saver>,
-    /// After them: what the transcript gets (run_tse.sh then run_se.sh's
-    /// output).
-    cleaned: Saver,
-}
-
-/// Saves one of the agent's voice files while a call is being recorded:
-/// `Agent voice\<recording> <which>.wav`, beside the call recording.
-struct Saver {
-    which: &'static str,
-    file: Option<(PathBuf, record::Wav)>,
-}
-
-impl Saver {
-    fn new(which: &'static str) -> Saver {
-        Saver { which, file: None }
-    }
-
-    /// Adds `audio` for the recording `recording` (None: no call being
-    /// recorded), starting or finishing files as recordings come and go.
-    fn save(&mut self, recording: Option<PathBuf>, audio: &[i16]) {
-        let want = recording.map(|r| record::agent_voice_path(&r, self.which));
-        if self.file.as_ref().map(|(p, _)| p) != want.as_ref() {
-            if let Some((_, mut wav)) = self.file.take() {
-                let _ = wav.patch();
-            }
-            self.file = want.and_then(|p| {
-                if let Some(dir) = p.parent() {
-                    fs::create_dir_all(dir).ok()?;
-                }
-                record::Wav::create(&p).ok().map(|w| (p, w))
-            });
-        }
-        if let Some((_, wav)) = &mut self.file
-            && wav.write(audio).is_err()
-        {
-            self.file = None;
-        }
     }
 }
 
@@ -488,12 +406,23 @@ fn read_sample(path: &Path) -> Result<Vec<f32>, String> {
 
 /// Lowers this thread below normal priority: extraction is never more urgent
 /// than anything else on the PC, least of all the call's audio.
-fn below_normal_priority() {
+pub(crate) fn below_normal_priority() {
     use windows::Win32::System::Threading::{
         GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
     };
     // SAFETY: a plain Win32 call on this thread's own pseudo-handle.
     let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
+}
+
+/// The server's id for the voice sample at `sample`, sending it (POST
+/// /enroll); for the live stream (remote_tse.rs).
+pub(crate) fn enroll(settings: &Settings, sample: &Path) -> Result<String, String> {
+    Client::new(settings.clone(), sample.to_path_buf()).enroll()
+}
+
+/// The server's host name, from its url.
+pub(crate) fn host(settings: &Settings) -> Option<String> {
+    Url::parse(&settings.url).ok().map(|u| u.host)
 }
 
 /// Talks to the extraction server.
@@ -722,28 +651,6 @@ mod tests {
         import_sample(&dir.join("not there.mp3"), &sample);
         assert_eq!(TELEMETRY.voice.load(Relaxed), ipc::VOICE_BAD_FILE);
         assert_eq!((fs::read(&sample).unwrap().len() - 44) / 2, kept);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn saver_follows_the_recording() {
-        let dir = std::env::temp_dir().join(format!("clearvoice-saver-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let (a, b) = (dir.join("a.wav"), dir.join("b.wav"));
-        let (mut noisy, mut cleaned) = (Saver::new("noisy"), Saver::new("cleaned"));
-        noisy.save(Some(a.clone()), &[1, 2, 3]);
-        cleaned.save(Some(a.clone()), &[1, 2, 3]);
-        noisy.save(Some(a.clone()), &[4]);
-        noisy.save(None, &[5]); // no call being recorded: nothing
-        noisy.save(Some(b.clone()), &[6, 7]);
-        noisy.save(None, &[8]); // the recording stopped
-        let len = |p: &Path| (fs::read(p).unwrap().len() - 44) / 2;
-        // Both files in the "Agent voice" folder beside the recordings.
-        let folder = dir.join("Agent voice");
-        assert_eq!(len(&folder.join("a noisy.wav")), 4);
-        assert_eq!(len(&folder.join("a cleaned.wav")), 3);
-        assert_eq!(len(&folder.join("b noisy.wav")), 2);
-        assert!(!folder.join("b cleaned.wav").exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -984,17 +891,20 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("models/DeepFilterNet3_onnx.tar.gz")
     }
 
-    /// The team's configuration on this PC, block by block as during a call
-    /// (no pacing), on a recording: WeSep on every 2 s block, then speech
-    /// enhancement. Reports how long each block took and writes the result.
-    /// Set YAL_CLEAN_TEST to "<dir with onnxruntime.dll and wesep\\>|<voice
-    /// sample.wav>|<noisy recording.wav>|<output.wav>" (16 kHz mono WAV).
+    /// The team's configuration on this PC on a recording, block by block
+    /// through the same steps as `clean()` during a recorded call (no
+    /// pacing): WeSep on every 2 s block, then speech enhancement, saved by
+    /// the app's own `Dump`. The files land where a call recorded as
+    /// `<recording.wav>` would put them: `Agent voice\<recording>\` beside it
+    /// (input, audio_tse and audio_tse_se as M4A, and rtf.csv). Set
+    /// YAL_CLEAN_TEST to "<dir with onnxruntime.dll and wesep\>|<voice
+    /// sample.wav>|<noisy recording.wav>|<recording.wav>" (16 kHz mono WAV).
     /// cargo test --release extracts_then_enhances -- --ignored --nocapture
     #[test]
     #[ignore = "needs the WeSep files and test recordings"]
     fn extracts_then_enhances() {
         let spec = std::env::var("YAL_CLEAN_TEST").expect("set YAL_CLEAN_TEST");
-        let [dir, sample, input, output] = spec.split('|').collect::<Vec<_>>()[..] else {
+        let [dir, sample, input, recording] = spec.split('|').collect::<Vec<_>>()[..] else {
             panic!("YAL_CLEAN_TEST needs 4 parts");
         };
         let files = tse::Files::find(Path::new(dir)).expect("WeSep files");
@@ -1008,22 +918,37 @@ mod tests {
             .iter()
             .map(|&c| i16::from_le_bytes(c))
             .collect();
-        let (mut blocks, mut cleaned) = (Blocks::default(), Vec::new());
+        let recording = Some(PathBuf::from(recording));
+        let (mut blocks, mut dump) = (Blocks::default(), crate::stages::Dump::new(true));
+        let (out, relay) = std::sync::mpsc::channel();
+        // As the transcript side does, with each stage saved as a recorded
+        // call's would be.
+        let mut step = |raw: &[i16], tse: &[i16], tse_took| {
+            let started = Instant::now();
+            let se = enhancer.process(tse);
+            let se_took = Some(started.elapsed());
+            dump.add(recording.clone(), raw, tse, tse_took, &se, se_took);
+            send(&se, None, &out);
+        };
         for chunk in audio.chunks(CHUNK) {
             if let Some(block) = blocks.push(chunk) {
-                let t = Instant::now();
-                let c = local.extract(&block).unwrap();
-                cleaned.extend(enhancer.process(&c));
-                println!("block {:.2} s (2 threads)", t.elapsed().as_secs_f32());
+                let started = Instant::now();
+                let tse = local.extract(&block).unwrap();
+                step(&block, &tse, Some(started.elapsed()));
             }
         }
-        cleaned.extend(enhancer.process(&blocks.flush()));
-        // Speech enhancement works in 10 ms frames: silence after the end
-        // brings out the last part of one.
-        cleaned.extend(enhancer.process(&[0; CHUNK]));
-        assert!(cleaned.len() >= audio.len());
-        cleaned.truncate(audio.len());
-        record::write_wav(Path::new(output), &cleaned).unwrap();
+        let rest = blocks.flush();
+        step(&rest, &rest, None);
+        drop(out);
+        let sent: usize = relay.iter().map(|c| c.len()).sum();
+        println!("{} samples in, {sent} on to the transcript", audio.len());
+        dump.close().expect("a call's files").join().unwrap();
+        let dir = record::agent_voice_dir(recording.as_ref().unwrap());
+        println!("{}", fs::read_to_string(dir.join("rtf.csv")).unwrap());
+        for name in crate::stages::STAGES {
+            assert!(dir.join(format!("{name}.m4a")).is_file(), "{name}.m4a");
+        }
+        println!("written to {}", dir.display());
     }
 
     /// Against a real voice server (voice-server/voice_server.py): sends a

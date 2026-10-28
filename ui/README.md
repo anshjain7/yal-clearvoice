@@ -72,6 +72,7 @@ transcript pane says transcription is off and no audio leaves the PC.
 [transcription]
 api_key = <Sarvam key>
 language = auto        ; or en-IN, hi-IN, ...
+after_call = on         ; off: no after-call pass (see below)
 [summary]
 url = http://<server>/v1/chat/completions
 model = <model name>
@@ -87,25 +88,85 @@ url = http://<server>:8090   ; only to use a voice server instead
 api_key = <key>
 ```
 
-The window shows **Register my voice** (a 20 s voice sample). The agent's side of
-the transcript then goes through WeSep speaker extraction: on the PC (the
-`wesep\` folder and `onnxruntime.dll` ship with the app), or on a voice server
-when `[voice] url` is set (see `voice-server/README.md`).
+The window shows **Register my voice** (a 20 s voice sample): the voice TSE
+keeps. With a voice server (`[voice] url`, see `voice-server/README.md`), the
+agent's side of the transcript goes through WeSep there.
 
-On the PC it follows the team's configuration (`run_tse.sh`, then
-`run_se.sh`): WeSep works on the agent's raw microphone, before noise
-removal, on every 2 s of it one after another (no overlapping chunks), with
-no remix; then DeepFilterNet3 speech enhancement (at the `[noise]` limit)
-cleans the result. That's what the transcript gets. It runs below normal
-priority, so call audio is never affected, and extracts every block whatever
-the PC's speed: on a PC slower than WeSep needs, the agent's side of the
-transcript falls further behind as the call goes on, and what's still
-waiting when the call ends isn't transcribed.
+On the PC the agent's voice goes through one live chain, in the team's
+order (TSE as in `run_tse.sh`, then speech enhancement as in `run_se.sh`):
 
-While a call is recorded, the agent's own voice is saved before and after the
-models, covering the same stretch, in `Recordings\Agent voice\`:
-`<date time> noisy.wav` (the raw microphone the models get) and
-`<date time> cleaned.wav` (after WeSep and speech enhancement).
+    microphone -> TSE -> DeepFilterNet3 (at the [noise] limit) -> VB-CABLE
+
+What comes out goes to the calling app, so to the customer, and the
+transcript listens to it too, by loopback of VB-CABLE, like the customer's
+side from the headset.
+
+The TSE step is WeSep, on by default (the window's **Voice filter (WeSep)**
+box, shown when the WeSep files ship with the engine or a voice server is
+set, switches it off and on). WeSep's public model looks at audio after
+each moment as well as before, so the step runs it on a sliding window:
+
+    |<------ left context (2.0 s) ------>|<- hop (0.32 s) ->|<- lookahead (0.2 s) ->|
+    model input = the whole window; output = only the hop
+
+Every hop, once the lookahead after it has come in, WeSep runs on the whole
+window and only the hop is kept, its first 20 ms crossfaded with the window
+before's version. The lookahead keeps the hop away from the end of the
+model's input, where it's weakest. Then DeepFilterNet3 does speech
+enhancement, as `run_se.sh` (MossFormer2 is too heavy for the agents'
+laptops). The hops play a fixed delay behind the microphone: hop +
+lookahead + `budget_ms`, the time allowed for the compute.
+
+- **With a GPU voice server** (`[voice]` url; voice-server/README.md),
+  WeSep runs there: about **0.67 s** late, every hop cleaned.
+- **On this PC's CPU** (no server), `budget_ms` is 1800: about **2.3 s**
+  late. A laptop CPU takes longer than a hop for each window (about 1 s on
+  the development PC's i5-12450H on mains, 3 s of compute per second of
+  audio), so WeSep cleans the newest hop that's ready each time, about one
+  in three, and the others play as recorded; the window shows "PC too
+  slow". Given the time (fed 4 times slower than real time), every hop is
+  cleaned and the colleague in the team's InputMixx recording is turned
+  down as much as on the server (9-11 dB in their clearest seconds).
+
+The window settings are in `[voice]`: `context_ms`, `hop_ms`,
+`lookahead_ms`, `budget_ms`. A hop not ready in time (or WeSep unable to
+run: no voice sample, server unreachable) goes out as recorded, and the
+delay stays the same. Unticking the box goes back to DeepFilterNet3 alone
+at once. On this PC, WeSep gets half the logical processors, 2 to 4 (or
+`[voice] threads`, if more).
+
+While a call is recorded, the agent's own voice is saved at each step of the
+live chain, each covering the same stretch, in a folder per call,
+`Recordings\Agent voice\<date time>\`:
+
+- `input.m4a`: the microphone;
+- `audio_tse.m4a`: after TSE (WeSep's output, lined up with `input`; the
+  microphone as it was while the voice filter is off);
+- `audio_tse_se.m4a`: after DeepFilterNet3 too: what the customer and the
+  transcript get;
+- `rtf.csv`: each step's real-time factor (time it took / length of the
+  audio; under 1 keeps up), for every 2 s and for the whole call.
+
+After a recorded call, an after-call pass works on the agent's side the
+way the team's offline setup does, where nothing is waiting: WeSep on the
+call's `input`, 10 s at a time, then DeepFilterNet3, saved beside the
+stages as `after_call_tse.m4a` and `after_call_tse_se.m4a` (their
+real-time factors go in `rtf.csv`, what happened in `after_call.log`). The
+cleaned voice, cut into utterances, then goes to Sarvam's batch service,
+and the agent's new lines, merged in time with the customer's from the live
+transcript, make the call's improved transcript. The window summarizes it
+again: the improved summary replaces the call's note and saved copy (and
+the window's view, if it still shows that call). The first summary, from
+the live transcript, comes at Stop as before. `[transcription] after_call =
+off` turns the pass off (it sends the agent's side to Sarvam a second time).
+
+The live stage hands a copy of every 10 ms it sends out to a separate
+thread below normal priority, without waiting; if that thread falls behind,
+copies are dropped, never the call's audio.
+
+They're written as WAV during the call and made M4A once it's over, so the
+encoding takes nothing from the call; where Windows can't encode M4A ("N"
+editions without the Media Feature Pack), they stay WAV.
 
 ## Protocol (the pipe contract)
 
@@ -117,6 +178,7 @@ and the engine replies with one JSON line. No audio crosses the pipe.
 | `poll` | telemetry |
 | `list` | device list |
 | `nc on` / `nc off` | telemetry |
+| `tse on` / `tse off` | telemetry; the voice filter (WeSep), on at start |
 | `mic <id>` / `mic default` | telemetry |
 | `spk <id>` / `spk default` | telemetry |
 | `strength <0-100>` | telemetry (accepted, but has no effect until the engine exposes the attenuation limit) |
@@ -140,6 +202,9 @@ Telemetry:
  "cpu_pct":8,"errors":0,"strength_supported":false,
  "mic_name":"Microphone (Detecta 201 USB)","headset_name":"Speakers (Detecta 201 USB)"}
 ```
+
+Newer engines add `voice` and `live_tse` (the voice filter, WeSep: `off`,
+`on`, `late`, `failed`, or `unavailable` without the WeSep files).
 
 `notice` codes:
 

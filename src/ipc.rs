@@ -76,6 +76,10 @@ pub struct Telemetry {
     pub notice: AtomicU8,
     /// One of the VOICE_* codes.
     pub voice: AtomicU64,
+    /// Live TSE's state: livetse::OFF, ON, FAILED, LATE or UNAVAILABLE.
+    pub live_tse: AtomicU8,
+    /// How far behind the microphone live TSE plays, ms (for the window).
+    pub live_tse_delay_ms: AtomicU64,
     /// End-to-end send-path latency, microseconds (set by the virtual mic).
     pub latency_us: AtomicU64,
     /// DeepFilterNet per-frame processing time, microseconds.
@@ -115,6 +119,8 @@ impl Telemetry {
             nc_on: AtomicBool::new(true),
             dfn_state: AtomicU8::new(DFN_BYPASS),
             voice: AtomicU64::new(VOICE_OFF),
+            live_tse: AtomicU8::new(4),
+            live_tse_delay_ms: AtomicU64::new(0),
             notice: AtomicU8::new(NOTICE_NONE),
             latency_us: AtomicU64::new(0),
             busy_us: AtomicU64::new(0),
@@ -177,6 +183,8 @@ pub enum UiCommand {
     RecordVoice,
     /// Make the voice sample from an audio file instead.
     ImportVoice(std::path::PathBuf),
+    /// Live TSE (livetse.rs) on/off: a test, off by default.
+    LiveTse(bool),
 }
 
 /// Total CPU time this process has used across all threads.
@@ -340,6 +348,14 @@ fn handle(cmd: &str, commands: &Sender<UiCommand>) -> String {
             transcribe::end_call();
             telemetry_json()
         }
+        ("tse", "on") => {
+            send(UiCommand::LiveTse(true));
+            telemetry_json()
+        }
+        ("tse", "off") => {
+            send(UiCommand::LiveTse(false));
+            telemetry_json()
+        }
         ("voice", "record") => {
             send(UiCommand::RecordVoice);
             telemetry_json()
@@ -379,7 +395,7 @@ fn telemetry_json() -> String {
         "{{\"type\":\"telemetry\",\"mic_connected\":{},\"spk_connected\":{},\
          \"spk_selectable\":{},\"nc\":{},\"dfn\":\"{}\",\"notice\":{},\"latency_ms\":{},\
          \"processing_ms\":{:.2},\"cpu_pct\":{},\"errors\":{},\"strength_supported\":false,\
-         \"mic_name\":\"{}\",\"headset_name\":\"{}\",\"voice\":\"{}\"}}",
+         \"mic_name\":\"{}\",\"headset_name\":\"{}\",\"voice\":\"{}\",\"live_tse\":\"{}\",\"live_tse_delay_ms\":{}}}",
         TELEMETRY.mic_connected.load(Relaxed),
         TELEMETRY.spk_connected.load(Relaxed),
         TELEMETRY.spk_selectable.load(Relaxed),
@@ -393,7 +409,20 @@ fn telemetry_json() -> String {
         escape(&mic_name),
         escape(&headset_name),
         voice_name(TELEMETRY.voice.load(Relaxed)),
+        live_tse_name(TELEMETRY.live_tse.load(Relaxed)),
+        TELEMETRY.live_tse_delay_ms.load(Relaxed),
     )
+}
+
+fn live_tse_name(state: u8) -> &'static str {
+    match state {
+        0 => "off",
+        1 => "on",
+        2 => "failed",
+        3 => "late",
+        5 => "server_down",
+        _ => "unavailable",
+    }
 }
 
 fn voice_name(state: u64) -> &'static str {
@@ -461,12 +490,16 @@ mod tests {
         assert!(reply.contains("\"type\":\"telemetry\""));
         assert!(
             reply.contains("\"headset_name\":\"Speakers (Detecta 201 USB)\",")
-                && reply.ends_with("\"voice\":\"off\"}"),
+                && reply.contains("\"voice\":\"off\",\"live_tse\":\""),
             "{reply}"
         );
         assert!(matches!(rx.try_recv(), Ok(UiCommand::Nc(true))));
         handle("nc off", &tx);
         assert!(matches!(rx.try_recv(), Ok(UiCommand::Nc(false))));
+        handle("tse on", &tx);
+        assert!(matches!(rx.try_recv(), Ok(UiCommand::LiveTse(true))));
+        handle("tse off", &tx);
+        assert!(matches!(rx.try_recv(), Ok(UiCommand::LiveTse(false))));
         handle("voice record", &tx);
         assert!(matches!(rx.try_recv(), Ok(UiCommand::RecordVoice)));
         handle(r"voice import C:/Users/a b/Desktop/my voice.m4a", &tx);

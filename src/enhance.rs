@@ -72,14 +72,14 @@ impl Enhancer {
 
 /// A windowed-sinc low-pass at 8 kHz for 48 kHz audio, run as a stream: it
 /// keeps the last few samples of each call for the next.
-struct Fir {
+pub(crate) struct Fir {
     taps: Vec<f32>,
     /// The input's last `taps.len() - 1` samples.
     history: Vec<f32>,
 }
 
 impl Fir {
-    fn new() -> Fir {
+    pub(crate) fn new() -> Fir {
         let n = 32 * FACTOR + 1;
         let mid = (n / 2) as f32;
         let cutoff = 0.5 / FACTOR as f32;
@@ -102,7 +102,7 @@ impl Fir {
     }
 
     /// Filters `x`, returning every `step`-th output (`x.len()` a multiple of it).
-    fn filter(&mut self, x: &[f32], step: usize) -> Vec<f32> {
+    pub(crate) fn filter(&mut self, x: &[f32], step: usize) -> Vec<f32> {
         let h = self.history.len();
         let mut buf = std::mem::take(&mut self.history);
         buf.extend_from_slice(x);
