@@ -542,32 +542,38 @@ mod tests {
         }
     }
 
-    /// The stage on a real recording, in real time, with today's WeSep:
-    /// YAL_LIVETSE_TEST="<dir with onnxruntime.dll and wesep\>|<voice
-    /// sample.wav>|<recording>|<out.wav>". Prints how far behind WeSep fell.
-    /// With YAL_LIVETSE_DFN (DeepFilterNet3_onnx.tar.gz), the output goes
-    /// through noise removal too, as in the app.
+    /// The live chain on a real recording, in real time, as in the app: this
+    /// stage (today's WeSep, 3 s chunks overlapping by 1 s), then
+    /// DeepFilterNet3. YAL_LIVETSE_TEST="<dir with onnxruntime.dll and
+    /// wesep\\>|<voice sample>|<recording>|<out folder>", YAL_LIVETSE_DFN =
+    /// DeepFilterNet3_onnx.tar.gz. Saves input.m4a, audio_tse.m4a and
+    /// audio_tse_se.m4a (lined up, from the recording's start) and rtf.csv in
+    /// the folder, and prints how far behind WeSep fell.
     /// cargo test --release live_tse_on_a_recording -- --ignored --nocapture
     #[test]
     #[ignore = "needs the WeSep files and a recording; runs in real time"]
     fn live_tse_on_a_recording() {
         use crate::ring;
+        use std::path::Path;
         let spec = std::env::var("YAL_LIVETSE_TEST").expect("set YAL_LIVETSE_TEST");
         let [dir, sample, recording, out] = spec.split('|').collect::<Vec<_>>()[..] else {
             panic!("YAL_LIVETSE_TEST needs 4 parts");
         };
+        let out = Path::new(out);
+        std::fs::create_dir_all(out).unwrap();
         // The voice sample as the app keeps it: a 16 kHz WAV.
-        let voice = std::path::Path::new(out).with_extension("voice.wav");
-        let enrolled = crate::audiofile::read(std::path::Path::new(sample)).unwrap();
+        let voice = std::env::temp_dir().join(format!("livetse-voice-{}.wav", std::process::id()));
+        let enrolled = crate::audiofile::read(Path::new(sample)).unwrap();
         std::fs::write(&voice, crate::record::wav_bytes(&enrolled)).unwrap();
         let setup = Setup {
-            files: tse::Files::find(std::path::Path::new(dir)).expect("WeSep files"),
+            files: tse::Files::find(Path::new(dir)).expect("WeSep files"),
             threads: std::env::var("YAL_LIVETSE_THREADS")
                 .map_or(threads(2), |t| t.parse().unwrap()),
             sample: voice.clone(),
         };
+        let model = std::env::var("YAL_LIVETSE_DFN").expect("set YAL_LIVETSE_DFN");
         // 48 kHz: each 16 kHz sample three times, then smoothed.
-        let mix = crate::audiofile::read(std::path::Path::new(recording)).unwrap();
+        let mix = crate::audiofile::read(Path::new(recording)).unwrap();
         let tripled: Vec<f32> = mix
             .iter()
             .flat_map(|&v| [f32::from(v) / 32768.0; 3])
@@ -576,28 +582,48 @@ mod tests {
         let frames = mic.len() / FRAME;
         let control = Control::default();
         control.enabled.store(true, Relaxed);
-        let (mut tx, mut rx) = ring::new(64);
-        let (mut out_tx, mut out_rx) = ring::new(16);
-        let (mut df_tx, mut df_rx) = ring::new(64);
-        let (models, models_rx) = mpsc::channel();
         let df_control = crate::denoise::Control::default();
         df_control.enabled.store(true, Relaxed);
-        let (mut late, mut sent) = (Vec::new(), Vec::new());
+        let (mut tx, mut rx) = ring::new(64);
+        let (mut mid_tx, mut mid_rx) = ring::new(16);
+        let (mut df_tx, mut df_rx) = ring::new(64);
+        // The stages' copies, each numbered by the frame sent on from here:
+        // (microphone lined up, TSE) from this stage, (TSE, SE) from
+        // DeepFilterNet3.
+        let (mut tse_tap_tx, mut tse_tap_rx) = ring::new(1024);
+        let (mut se_tap_tx, mut se_tap_rx) = ring::new(1024);
+        let total = frames + DELAY_FRAMES;
+        let mut stages = vec![[[0f32; FRAME]; 3]; total];
+        let mut late = Vec::new();
+        let (models, models_rx) = mpsc::channel();
+        models
+            .send(crate::denoise::DeepFilter::new(Path::new(&model), 15.0).unwrap())
+            .unwrap();
         thread::scope(|s| {
-            let (rx, out_tx, control) = (&mut rx, &mut out_tx, &control);
-            s.spawn(move || run(rx, out_tx, None, control, setup));
-            let heard_rx = match std::env::var("YAL_LIVETSE_DFN") {
-                Ok(model) => {
-                    let df = crate::denoise::DeepFilter::new(std::path::Path::new(&model), 15.0);
-                    models.send(df.unwrap()).unwrap();
-                    let (input, output, dc) = (&mut out_rx, &mut df_tx, &df_control);
-                    s.spawn(move || crate::denoise::run(models_rx, input, output, dc));
-                    &mut df_rx
+            let (rx, mid_tx, control) = (&mut rx, &mut mid_tx, &control);
+            let tap = &mut tse_tap_tx;
+            s.spawn(move || run(rx, mid_tx, Some(tap), control, setup));
+            let (input, output, dc, tap) = (&mut mid_rx, &mut df_tx, &df_control, &mut se_tap_tx);
+            s.spawn(move || crate::denoise::run_tapped(models_rx, input, output, dc, Some(tap)));
+            let mut collect = |stages: &mut Vec<[[f32; FRAME]; 3]>| {
+                while df_rx.pop().is_some() {}
+                while let Some(c) = tse_tap_rx.pop() {
+                    if let Some(st) = stages.get_mut(c.seq as usize) {
+                        for (i, p) in c.samples().as_chunks::<2>().0.iter().enumerate() {
+                            (st[0][i], st[1][i]) = (p[0], p[1]);
+                        }
+                    }
                 }
-                Err(_) => &mut out_rx,
+                while let Some(c) = se_tap_rx.pop() {
+                    if let Some(st) = stages.get_mut(c.seq as usize) {
+                        for (i, p) in c.samples().as_chunks::<2>().0.iter().enumerate() {
+                            st[2][i] = p[1];
+                        }
+                    }
+                }
             };
             let started = Instant::now();
-            for k in 0..frames + DELAY_FRAMES {
+            for k in 0..total {
                 let mut f = AudioFrame::new(1);
                 f.seq = k as u64;
                 if k < frames {
@@ -607,36 +633,67 @@ mod tests {
                 assert!(tx.push(&f));
                 let due = started + Duration::from_millis(10 * (k as u64 + 1));
                 thread::sleep(due.saturating_duration_since(Instant::now()));
-                while let Some(o) = heard_rx.pop() {
-                    sent.extend_from_slice(o.samples());
-                }
+                collect(&mut stages);
                 if ipc::TELEMETRY.live_tse.load(Relaxed) == LATE {
                     late.push(k);
                     ipc::TELEMETRY.live_tse.store(ON, Relaxed);
                 }
             }
+            thread::sleep(Duration::from_millis(100));
+            collect(&mut stages);
             control.stop.store(true, Relaxed);
             df_control.stop.store(true, Relaxed);
         });
-        let (handled, busy) = (control.handled.load(Relaxed), control.busy_us.load(Relaxed));
+        let rtf = |handled: u64, busy: u64| {
+            let audio = handled as f64 * 0.01;
+            (
+                audio,
+                busy as f64 / 1e6,
+                busy as f64 / 1e6 / audio.max(1e-9),
+            )
+        };
+        let tse_rtf = rtf(control.handled.load(Relaxed), control.busy_us.load(Relaxed));
+        let se_rtf = rtf(
+            df_control.handled.load(Relaxed),
+            df_control.busy_us.load(Relaxed),
+        );
         println!(
-            "{frames} frames, WeSep handled {handled} ({:.2} s), RTF {:.2}, {} frames late{}",
-            handled as f64 * 0.01,
-            busy as f64 / 1e6 / (handled as f64 * 0.01).max(1e-9),
+            "{frames} frames, WeSep RTF {:.2}, SE RTF {:.2}, {} frames late{}",
+            tse_rtf.2,
+            se_rtf.2,
             late.len(),
             late.first().map_or(String::new(), |f| format!(
                 ", from frame {f} to {}",
                 late.last().unwrap()
             )),
         );
-        // What the customer would have heard, from the delay on, at 16 kHz.
-        let heard: Vec<i16> = Fir::new()
-            .filter(&sent[..sent.len() / DOWN * DOWN], DOWN)
-            .iter()
-            .skip(DELAY_FRAMES * FRAME / DOWN)
-            .map(|&v| (v * 32768.0).clamp(-32768.0, 32767.0) as i16)
-            .collect();
-        std::fs::write(out, crate::record::wav_bytes(&heard)).unwrap();
+        // Each stage at 16 kHz, from the recording's start (the frames after
+        // the delay).
+        for (i, name) in ["input", "audio_tse", "audio_tse_se"].iter().enumerate() {
+            let x: Vec<f32> = stages[DELAY_FRAMES..].iter().flat_map(|st| st[i]).collect();
+            let x: Vec<i16> = Fir::new()
+                .filter(&x[..x.len() / DOWN * DOWN], DOWN)
+                .iter()
+                .map(|&v| (v * 32768.0).clamp(-32768.0, 32767.0) as i16)
+                .collect();
+            crate::audiofile::write_m4a(&x, &out.join(format!("{name}.m4a"))).unwrap();
+        }
+        std::fs::write(
+            out.join("rtf.csv"),
+            format!(
+                "step,audio_s,time_s,rtf,note\n\
+                 tse,{:.2},{:.3},{:.3},WeSep 3 s chunks overlapping 1 s; {} of {frames} frames late (played as recorded)\n\
+                 se,{:.2},{:.3},{:.3},DeepFilterNet3 15 dB\n",
+                tse_rtf.0,
+                tse_rtf.1,
+                tse_rtf.2,
+                late.len(),
+                se_rtf.0,
+                se_rtf.1,
+                se_rtf.2
+            ),
+        )
+        .unwrap();
         let _ = std::fs::remove_file(voice);
     }
 }
