@@ -2,16 +2,25 @@
 //! and DeepFilterNet3, switched on from the window (off by default).
 //!
 //! WeSep's public model looks at audio after each moment as well as before,
-//! so it can't work frame by frame: this stage gathers 2 s of the
-//! microphone, has a worker thread run WeSep on it (with the 0.5 s before it
-//! as context), and plays the results out at a steady pace a fixed DELAY
-//! behind, long enough for WeSep to finish each block in time. So while it's
-//! on, the customer hears the agent about 4 s late: a test of what TSE does
-//! to the call, not something to use on real calls. A causal model, trained
-//! for this, would take its place with about 30 ms of delay.
+//! so it can't work frame by frame. As the team's
 //!
-//! Off, frames pass straight through. A block WeSep can't do in time, or at
-//! all, plays as it was recorded, or as silence when it's late.
+//!   run_tse.sh --enroll <voice sample> --input <mic> --chunk_sec 3.0 --overlap_sec 1.0
+//!
+//! this stage cuts the microphone into 3 s chunks overlapping by 1 s (the
+//! second before, then 2 s new), has a worker thread run WeSep on each as
+//! soon as it's gathered, and joins the results chunk by chunk: the
+//! overlapping second crossfaded from the chunk before to this one. It plays
+//! them out at a steady pace a fixed DELAY behind, long enough for WeSep to
+//! finish each chunk in time. So while it's on, the customer hears the agent
+//! about 5 s late: a test of what TSE does to the call, not something to use
+//! on real calls. Speech enhancement (run_se.sh) follows in the chain:
+//! DeepFilterNet3. A causal model, trained for this, would take WeSep's
+//! place with about 30 ms of delay.
+//!
+//! Off, frames pass straight through. A chunk WeSep can't do at all, or not
+//! in time, plays as it was recorded (still delayed), so the customer always
+//! hears the agent. When WeSep falls behind, it skips chunks already past
+//! their time to catch up.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -27,16 +36,21 @@ use crate::ring::{Consumer, Producer};
 use crate::stream;
 use crate::tse;
 
-/// 10 ms frames in a WeSep block: 2 s.
+/// 10 ms frames of new audio in each chunk: 2 s.
 const BLOCK_FRAMES: usize = 200;
-/// Frames the output runs behind the microphone while on: 4 s (a block's
-/// 2 s, then up to 2 s for WeSep).
-pub const DELAY_FRAMES: usize = 400;
-/// Earlier audio given to WeSep with each block, 16 kHz samples: 0.5 s.
-const CONTEXT: usize = 8000;
+/// The earlier audio each chunk starts with, 16 kHz samples: 1 s, so chunks
+/// are 3 s overlapping by 1 s (--chunk_sec 3.0 --overlap_sec 1.0).
+const OVERLAP: usize = 16_000;
+/// Frames the output runs behind the microphone while on: 5 s (a chunk's
+/// 2 s of new audio, then up to 2 s for WeSep, and the 1 s at its end held
+/// back to crossfade with the next chunk).
+pub const DELAY_FRAMES: usize = 500;
 /// 48 kHz to 16 kHz.
 const DOWN: usize = 3;
 const FRAME: usize = 480;
+
+/// The worker's answer for a chunk it skipped because it was already late.
+const SKIPPED: &str = "skipped: late";
 
 /// The stage's state for the window (`ipc::TELEMETRY.live_tse`).
 pub const OFF: u8 = 0;
@@ -129,6 +143,10 @@ pub fn run(
                                 s.finished(&cleaned);
                                 state(ON);
                             }
+                            Err(e) if e == SKIPPED => {
+                                state(LATE);
+                                s.finished_raw();
+                            }
                             Err(_) => {
                                 state(FAILED);
                                 s.finished_raw();
@@ -171,18 +189,23 @@ fn state(s: u8) {
 /// The stage while on.
 struct On {
     down: Fir,
-    up: Fir,
-    /// The block being gathered (48 kHz), and the 16 kHz audio before it.
+    /// The new audio being gathered (48 kHz), and the last second of the
+    /// block before it: the overlap the next chunk starts with, 48 kHz and,
+    /// for WeSep, 16 kHz.
     block: Vec<f32>,
-    context: Vec<f32>,
+    overlap: Vec<f32>,
+    overlap_low: Vec<f32>,
     /// Microphone frames waiting to be played out (the delay line), and the
-    /// cleaned audio ready to play, 48 kHz.
+    /// joined audio ready to play, 48 kHz.
     mics: VecDeque<AudioFrame>,
     ready: VecDeque<f32>,
-    /// Blocks sent to WeSep and not back yet, with their microphone audio,
-    /// in case WeSep fails on them.
+    /// Chunks sent to WeSep and not back yet, as recorded (48 kHz), in case
+    /// WeSep fails on them.
     pending: VecDeque<Vec<f32>>,
-    /// Silence sent in place of audio that wasn't ready (48 kHz samples):
+    /// The last chunk's final second, held back to crossfade with the next
+    /// chunk's first (48 kHz).
+    held: Vec<f32>,
+    /// Microphone audio sent in place of audio that wasn't ready (48 kHz):
     /// that much of what comes back is past its time and is dropped, so the
     /// delay stays DELAY_FRAMES.
     owed: usize,
@@ -194,17 +217,18 @@ impl On {
         silent.captured = None;
         On {
             down: Fir::new(),
-            up: Fir::new(),
             block: Vec::with_capacity(BLOCK_FRAMES * FRAME),
-            context: Vec::new(),
+            overlap: Vec::new(),
+            overlap_low: Vec::new(),
             mics: (0..DELAY_FRAMES).map(|_| silent).collect(),
             ready: VecDeque::from(vec![0.0; DELAY_FRAMES * FRAME]),
             pending: VecDeque::new(),
+            held: Vec::new(),
             owed: 0,
         }
     }
 
-    /// Queues audio to play, minus what silence already stood in for.
+    /// Queues audio to play, minus what the microphone already stood in for.
     fn ready(&mut self, audio: impl IntoIterator<Item = f32>) {
         let mut audio = audio.into_iter();
         while self.owed > 0 && audio.next().is_some() {
@@ -213,8 +237,8 @@ impl On {
         self.ready.extend(audio);
     }
 
-    /// Adds a microphone frame; once a block is full, returns it for WeSep:
-    /// 16 kHz, its context first.
+    /// Adds a microphone frame; once 2 s of new audio are in, returns the
+    /// chunk for WeSep: 16 kHz, the overlap first (none for the first).
     fn push(&mut self, frame: &AudioFrame) -> Option<Vec<f32>> {
         self.mics.push_back(*frame);
         self.block.extend_from_slice(frame.samples());
@@ -223,42 +247,68 @@ impl On {
         }
         let block = std::mem::take(&mut self.block);
         let low = self.down.filter(&block, DOWN);
-        let job: Vec<f32> = self.context.iter().chain(&low).copied().collect();
-        self.context = low[low.len() - CONTEXT..].to_vec();
-        self.pending.push_back(block);
+        let job: Vec<f32> = self.overlap_low.iter().chain(&low).copied().collect();
+        let chunk: Vec<f32> = self.overlap.iter().chain(&block).copied().collect();
+        self.overlap_low = low[low.len() - OVERLAP..].to_vec();
+        self.overlap = block[block.len() - OVERLAP * DOWN..].to_vec();
+        self.pending.push_back(chunk);
         Some(job)
     }
 
-    /// WeSep's result for the oldest block sent (16 kHz, context first).
+    /// WeSep's result for the oldest chunk sent (16 kHz, as sent).
     fn finished(&mut self, cleaned: &[f32]) {
-        let Some(block) = self.pending.pop_front() else {
+        let Some(chunk) = self.pending.pop_front() else {
             return;
         };
-        let new = &cleaned[cleaned.len().saturating_sub(block.len() / DOWN)..];
-        let mut stuffed = vec![0f32; new.len() * DOWN];
-        for (i, v) in new.iter().enumerate() {
+        // Back to 48 kHz: zeros between the samples, then the same filter as
+        // on the way down.
+        let mut stuffed = vec![0f32; chunk.len()];
+        for (i, v) in cleaned.iter().take(chunk.len() / DOWN).enumerate() {
             stuffed[i * DOWN] = v * DOWN as f32;
         }
-        let up = self.up.filter(&stuffed, 1);
-        self.ready(up);
+        let up = Fir::new().filter(&stuffed, 1);
+        self.join(&up, chunk.len() - BLOCK_FRAMES * FRAME);
     }
 
-    /// WeSep failed on the oldest block: it plays as recorded.
+    /// WeSep failed on the oldest chunk: it plays as recorded.
     fn finished_raw(&mut self) {
-        if let Some(block) = self.pending.pop_front() {
-            self.ready(block);
+        if let Some(chunk) = self.pending.pop_front() {
+            self.join(&chunk, chunk.len() - BLOCK_FRAMES * FRAME);
         }
+    }
+
+    /// Joins a chunk (48 kHz) whose first `overlap` samples are the same
+    /// stretch as the last chunk's held end: that stretch crossfaded from the
+    /// last chunk to this one, then this chunk up to its own last second,
+    /// which is held for the next.
+    fn join(&mut self, chunk: &[f32], overlap: usize) {
+        let (head, rest) = chunk.split_at(overlap);
+        let held = std::mem::take(&mut self.held);
+        let n = head.len().min(held.len());
+        let faded: Vec<f32> = (0..n)
+            .map(|i| {
+                let w = (i as f32 + 0.5) / n as f32;
+                held[i] * (1.0 - w) + head[i] * w
+            })
+            .collect();
+        self.ready(faded);
+        let keep = rest.len().saturating_sub(OVERLAP * DOWN);
+        self.ready(rest[..keep].iter().copied());
+        self.held = rest[keep..].to_vec();
     }
 
     /// The next frame out (cleaned, DELAY_FRAMES behind `now`), the
-    /// microphone frame it came from, and whether it was late (silence).
+    /// microphone frame it came from, and whether it was late (then it's
+    /// that microphone frame, as recorded).
     fn next(&mut self, now: &AudioFrame) -> (AudioFrame, AudioFrame, bool) {
         let mic = self.mics.pop_front().unwrap_or(AudioFrame::new(1));
         let mut out = AudioFrame::new(1);
         let late = self.ready.len() < FRAME;
         if late {
-            // What's there is played next time with the rest; the frame's
-            // worth after it is owed.
+            // The microphone as recorded goes out instead; what's there is
+            // played next time with the rest, and the frame's worth after it
+            // is owed.
+            out.samples_mut().copy_from_slice(mic.samples());
             self.owed += FRAME;
         } else {
             for s in out.samples_mut() {
@@ -279,7 +329,26 @@ impl On {
 fn worker(setup: &Setup, jobs: mpsc::Receiver<(u64, Vec<f32>)>, done: mpsc::Sender<Done>) {
     let mut model: Option<tse::Extractor> = None;
     let mut voice: Option<(Vec<f32>, std::time::SystemTime)> = None;
-    for (generation, mix) in jobs {
+    let mut waiting: VecDeque<(u64, Vec<f32>)> = VecDeque::new();
+    loop {
+        if waiting.is_empty() {
+            match jobs.recv() {
+                Ok(job) => waiting.push_back(job),
+                Err(_) => return,
+            }
+        }
+        waiting.extend(jobs.try_iter());
+        // A chunk with a newer one already waiting behind it is past its
+        // time (they come 2 s apart, and each has 2 s): skip it, so WeSep
+        // catches up instead of making every chunk after it late too.
+        while waiting.len() > 1 && waiting.front().is_some_and(|(_, m)| !m.is_empty()) {
+            let (generation, _) = waiting.pop_front().expect("checked above");
+            let skipped = (generation, false, Err(SKIPPED.to_string()), Duration::ZERO);
+            if done.send(skipped).is_err() {
+                return;
+            }
+        }
+        let (generation, mix) = waiting.pop_front().expect("one at least");
         let (started, warm) = (Instant::now(), mix.is_empty());
         let result = (|| -> Result<Vec<f32>, String> {
             if model.is_none() {
@@ -338,8 +407,8 @@ mod tests {
         let mut outs = Vec::new();
         for k in 0..DELAY_FRAMES + 2 * BLOCK_FRAMES {
             if let Some(job) = s.push(&tone_frame(k)) {
-                // A block plus its context, 16 kHz.
-                let ctx = if sent.is_empty() { 0 } else { CONTEXT };
+                // A chunk: the overlap (none for the first), then 2 s new, 16 kHz.
+                let ctx = if sent.is_empty() { 0 } else { OVERLAP };
                 assert_eq!(job.len(), ctx + BLOCK_FRAMES * FRAME / DOWN);
                 sent.push(job);
                 // "WeSep" hands it straight back, unchanged.
@@ -370,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn a_block_wesep_misses_plays_as_recorded_and_late_ones_are_silence() {
+    fn a_block_wesep_misses_or_late_plays_as_recorded() {
         let mut s = On::new();
         let mut outs = Vec::new();
         for k in 0..DELAY_FRAMES + BLOCK_FRAMES + 5 {
@@ -388,7 +457,50 @@ mod tests {
             s.push(&tone_frame(k));
             s.next(&tone_frame(k));
         }
-        assert!(s.next(&tone_frame(DELAY_FRAMES)).2);
+        // Late: the microphone it came from, as recorded, instead.
+        let (out, _, late) = s.next(&tone_frame(DELAY_FRAMES));
+        assert!(late);
+        assert_eq!(out.samples(), tone_frame(0).samples());
+    }
+
+    #[test]
+    fn chunks_are_3_s_overlapping_by_1_s_and_crossfaded() {
+        // A steady level, and a "WeSep" that scales chunk k by 1 + k / 10:
+        // which chunk each moment came from shows in its level.
+        let level = |k: usize| {
+            let mut f = AudioFrame::new(1);
+            f.seq = k as u64;
+            f.samples_mut().fill(0.1);
+            f
+        };
+        let gain = |k: usize| 1.0 + k as f32 / 10.0;
+        let mean = |x: &[f32]| x.iter().sum::<f32>() / x.len() as f32;
+        let mut s = On::new();
+        let (mut chunks, mut outs) = (0, Vec::new());
+        for k in 0..DELAY_FRAMES + 5 * BLOCK_FRAMES {
+            if let Some(job) = s.push(&level(k)) {
+                // 3 s each, the first 2 s (it has no second before it).
+                let secs = job.len() as f32 / 16_000.0;
+                assert_eq!(secs, if chunks == 0 { 2.0 } else { 3.0 });
+                let g = gain(chunks);
+                s.finished(&job.iter().map(|v| v * g).collect::<Vec<_>>());
+                chunks += 1;
+            }
+            outs.push(s.next(&level(k)).0);
+        }
+        // The microphone's frame m plays at m + DELAY_FRAMES. Chunk k (k > 0)
+        // covers frames 200k - 100 to 200k + 200: its own second in the
+        // middle at its own level, the second before it halfway through the
+        // crossfade from chunk k - 1.
+        let at = |m: usize| mean(outs[m + DELAY_FRAMES].samples()) / 0.1;
+        assert!((at(50) - gain(0)).abs() < 0.01, "{}", at(50));
+        for k in 1..4 {
+            let own = at(200 * k + 50);
+            assert!((own - gain(k)).abs() < 0.01, "chunk {k}: {own}");
+            let fade = at(200 * k - 50);
+            let half = (gain(k - 1) + gain(k)) / 2.0;
+            assert!((fade - half).abs() < 0.01, "chunk {k} crossfade: {fade}");
+        }
     }
 
     #[test]

@@ -313,9 +313,9 @@ sealed class MainForm : Form
     const string LiveTsePrompt =
         "This is a test. It runs the voice filter (WeSep) on your microphone during the "
         + "call, before noise removal, so the customer hears only your registered voice.\n\n"
-        + "Your voice will reach the customer about 4 seconds late. Use it only on test "
+        + "Your voice will reach the customer about 5 seconds late. Use it only on test "
         + "calls, not with real customers.\n\n"
-        + "If your PC can't keep up, short gaps of silence are sent instead. Untick it to "
+        + "If your PC can't keep up, your voice goes out unfiltered for those moments. Untick it to "
         + "go back to normal at once.";
 
     const string UploadPrompt =

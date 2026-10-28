@@ -107,11 +107,16 @@ by seconds.)
 
 To try today's WeSep on a call anyway, tick **Live voice filter (test)**
 (shown when the WeSep files ship with the engine; off at every start, and
-it asks first). The TSE step then runs WeSep on the microphone 2 s at a
-time, with 0.5 s before each piece for context, and plays the result 4 s
-behind: the customer hears the agent 4 s late. A piece WeSep hasn't
-finished by then is sent as silence (the window shows "PC too slow"), and
-the delay stays 4 s; one it fails on, as recorded. Unticking it goes back to
+it asks first). The TSE step then runs WeSep on the microphone chunk by
+chunk, as the team's `run_tse.sh --chunk_sec 3.0 --overlap_sec 1.0`: 3 s
+chunks overlapping by 1 s, each sent to WeSep as soon as it's gathered, the
+overlapping second crossfaded from one chunk's output to the next. Then
+DeepFilterNet3 does speech enhancement, as `run_se.sh` (MossFormer2 is too
+heavy for the agents' laptops). The result plays 5 s behind: the customer
+hears the agent 5 s late (2 s of new audio per chunk, up to 2 s for WeSep,
+and 1 s held back for the crossfade). A chunk WeSep hasn't finished by then
+goes out as recorded (the window shows "PC too slow"), and the delay stays
+5 s; one it fails on, as recorded. Unticking it goes back to
 the normal chain at once. WeSep gets half the PC's logical processors, 2 to
 4 (or `[voice] threads`, if more). On the development PC (i5-12450H, on
 battery, with DeepFilterNet3 running too) its real-time factor was 0.50 at
