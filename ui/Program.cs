@@ -199,7 +199,7 @@ sealed class MainForm : Form
         _liveTse.CheckedChanged += (_, _) =>
         {
             if (_loading) return;
-            if (_liveTse.Checked && MessageBox.Show(this, LiveTsePrompt, "Voice filter (WeSep)",
+            if (_liveTse.Checked && MessageBox.Show(this, LiveTsePrompt(_liveTseDelayMs), "Voice filter (WeSep)",
                     MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK)
             {
                 _loading = true;
@@ -311,11 +311,15 @@ sealed class MainForm : Form
         + "Your voice sample is kept on this PC, for your Windows account only, and used "
         + "only to recognise your voice in transcripts. You can register again at any time.";
 
-    const string LiveTsePrompt =
+    // How far behind the microphone the voice filter plays (UI thread; from
+    // the engine: about 0.7 s with a voice server, 3 s on this PC).
+    long _liveTseDelayMs = 3000;
+
+    static string LiveTsePrompt(long delayMs) =>
         "The voice filter (WeSep) keeps only your registered voice, for the customer and "
         + "the transcript, and removes other people's.\n\n"
-        + "Your voice reaches the customer about 3 seconds late while it's on.\n\n"
-        + "If your PC can't keep up, your voice goes out unfiltered for those moments. Untick it to "
+        + $"Your voice reaches the customer about {delayMs / 1000.0:0.#} seconds late while it's on.\n\n"
+        + "If it can't keep up, your voice goes out unfiltered for those moments. Untick it to "
         + "go back to normal at once.";
 
     const string UploadPrompt =
@@ -678,8 +682,10 @@ sealed class MainForm : Form
             "on" => ("On", Teal),
             "late" => ("PC too slow", Ink),
             "failed" => ("Error", Ink),
+            "server_down" => ("Server not reachable", Ink),
             _ => ("", Muted),
         };
+        long liveDelay = r.TryGetValue("live_tse_delay_ms", out var ld) ? Convert.ToInt64(ld) : 0;
         var (voiceText, voiceColor) = voice switch
         {
             "no_sample" => ("Not registered yet", Ink),
@@ -743,6 +749,7 @@ sealed class MainForm : Form
             _latency.Text = latency > 0 ? $"{latency} ms" : "—";
             _nc.Checked = nc;
             _liveTse.Visible = liveTse != "unavailable";
+            if (liveDelay > 0) _liveTseDelayMs = liveDelay;
             if (_liveTseWanted is null && liveTse != "unavailable")
             {
                 _liveTseWanted = liveTse != "off";

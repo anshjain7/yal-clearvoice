@@ -1,61 +1,35 @@
 //! Live TSE: WeSep in the live chain, between the microphone and
-//! DeepFilterNet3, for the customer and the transcript alike. On by default;
-//! the window can switch it off.
+//! DeepFilterNet3, for the customer and the transcript alike, on a sliding
+//! window (sliding.rs): every hop (0.32 s), WeSep on the 2.0 s before, the
+//! hop and the 0.2 s after, only the hop kept. On this PC's CPU, or on a GPU
+//! voice server when one is set up for it (`[voice]` url, remote_tse.rs). On
+//! by default; the window can switch it off.
 //!
-//! WeSep's public model looks at audio after each moment as well as before,
-//! so it can't work frame by frame. As the team's
+//! Latency is about hop + lookahead + compute: about 0.67 s with a GPU
+//! server. On a laptop CPU a window takes longer than a hop, so WeSep cleans
+//! only some hops (the newest ready each time) and the others play as
+//! recorded, at a fixed delay of hop + lookahead + `budget_ms` (1.8 s).
+//! Speech enhancement (run_se.sh) follows in the chain: DeepFilterNet3.
 //!
-//!   run_tse.sh --enroll <voice sample> --input <mic> --chunk_sec 1.5 --overlap_sec 0.5
-//!
-//! this stage cuts the microphone into 1.5 s chunks overlapping by 0.5 s
-//! (the half second before, then 1 s new), has a worker thread run WeSep on
-//! each as soon as it's gathered, and joins the results chunk by chunk: the
-//! overlapping half second crossfaded from the chunk before to this one. It
-//! plays them out at a steady pace a fixed DELAY behind, long enough for
-//! WeSep to finish each chunk in time. So while it's on, the customer hears
-//! the agent about 3 s late. Speech enhancement (run_se.sh) follows in the
-//! chain: DeepFilterNet3. A causal model, trained for this, would take
-//! WeSep's place with about 30 ms of delay.
-//!
-//! Off, frames pass straight through. A chunk WeSep can't do at all, or not
-//! in time, plays as it was recorded (still delayed), so the customer always
-//! hears the agent. When WeSep falls behind, it skips chunks already past
-//! their time to catch up.
+//! Off, frames pass straight through.
 
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use crate::enhance::Fir;
 use crate::frame::AudioFrame;
 use crate::ipc;
+use crate::remote_tse;
 use crate::ring::{Consumer, Producer};
+use crate::sliding::{self, Status, Streaming, Window};
 use crate::stream;
 use crate::tse;
 
-/// 10 ms frames of new audio in each chunk: 1 s.
-const BLOCK_FRAMES: usize = 100;
-/// The earlier audio each chunk starts with, 16 kHz samples: 0.5 s, so
-/// chunks are 1.5 s overlapping by 0.5 s (--chunk_sec 1.5 --overlap_sec 0.5).
-const OVERLAP: usize = 8_000;
-/// The overlap in 10 ms frames.
-const OVERLAP_FRAMES: usize = OVERLAP * DOWN / FRAME;
-/// Frames the output runs behind the microphone while on: 3 s (a chunk's
-/// 1 s of new audio, then up to 1.5 s for WeSep, and the 0.5 s at its end
-/// held back to crossfade with the next chunk).
-pub const DELAY_FRAMES: usize = 300;
-/// How long WeSep has for each chunk: 1.5 s.
-const WESEP_TIME: Duration =
-    Duration::from_millis(10 * (DELAY_FRAMES - BLOCK_FRAMES - OVERLAP_FRAMES) as u64);
-/// 48 kHz to 16 kHz.
-const DOWN: usize = 3;
-const FRAME: usize = 480;
-
-/// The worker's answer for a chunk it skipped because it was already late.
-const SKIPPED: &str = "skipped: late";
+/// The time allowed for WeSep on this PC's CPU, unless `budget_ms` says: a
+/// 2.5 s window took about 1.5 s on the development PC, and a hop can wait
+/// up to a hop for the one before.
+pub const CPU_BUDGET_MS: u32 = 1800;
 
 /// The stage's state for the window (`ipc::TELEMETRY.live_tse`).
 pub const OFF: u8 = 0;
@@ -63,10 +37,15 @@ pub const ON: u8 = 1;
 /// Switched on, but WeSep couldn't run (no voice sample, or its files
 /// failed): the voice passes through as recorded, still delayed.
 pub const FAILED: u8 = 2;
-/// A block was late: the customer heard a gap.
+/// A hop wasn't ready in time (the PC too slow): it played as recorded.
 pub const LATE: u8 = 3;
-/// WeSep's files aren't there: no live TSE (set at startup).
+/// WeSep's files aren't there, nor a server: no live TSE (set at startup).
 pub const UNAVAILABLE: u8 = 4;
+/// The voice server can't be reached: the voice passes through as recorded.
+pub const SERVER_DOWN: u8 = 5;
+/// "PC too slow" stays up this many frames after a late hop (1 s), so the
+/// window sees it.
+const LATE_SHOWN: u64 = 100;
 
 /// Shared between the stage and whoever drives it.
 #[derive(Default)]
@@ -74,19 +53,11 @@ pub struct Control {
     /// Live TSE wanted.
     pub enabled: AtomicBool,
     pub stop: AtomicBool,
-    /// Frames WeSep has handled while on, and the time it took (µs): its
-    /// real-time factor, for stages.rs's rtf.csv.
+    /// Frames WeSep has cleaned while on, and the time it took (µs): its
+    /// real-time factor, for stages.rs's rtf.csv (on this PC only).
     pub handled: AtomicU64,
     pub busy_us: AtomicU64,
 }
-
-/// A chunk for the worker: the stage's generation, when it was sent, and
-/// the audio (16 kHz; empty only loads WeSep and the voice sample).
-type Job = (u64, Instant, Vec<f32>);
-
-/// A job back from the worker: its generation, whether it was only a warm-up,
-/// WeSep's output (16 kHz) and how long it took.
-type Done = (u64, bool, Result<Vec<f32>, String>, Duration);
 
 /// WeSep's threads on the live call: half the PC's logical processors, 2 to
 /// 4 (2 threads fell behind on the development PC on battery), or `wanted`
@@ -96,11 +67,48 @@ pub fn threads(wanted: usize) -> usize {
     half.clamp(2, 4).max(wanted)
 }
 
-/// What WeSep works with: its files, its threads, and the voice sample.
+/// What WeSep works with: on a voice server (used when set), the stream's
+/// settings; on this PC, its files, threads, the window and how much of the
+/// microphone to mix back in; and the voice sample.
 pub struct Setup {
-    pub files: tse::Files,
+    pub files: Option<tse::Files>,
     pub threads: usize,
     pub sample: PathBuf,
+    pub remote: Option<remote_tse::Settings>,
+    pub window: Window,
+    pub remix: f32,
+}
+
+impl Setup {
+    /// How far behind the microphone the step plays, in 10 ms frames.
+    pub fn delay_frames(&self) -> usize {
+        self.remote
+            .as_ref()
+            .map_or(self.window, |r| r.window)
+            .delay_frames()
+    }
+
+    /// The stream, with WeSep on the server or on this PC.
+    fn start(&self) -> Option<Streaming> {
+        let delay = self.delay_frames();
+        if let Some(r) = &self.remote {
+            return Some(Streaming::start(
+                delay,
+                remote_tse::feed(r.clone(), self.sample.clone()),
+            ));
+        }
+        let files = self.files.clone()?;
+        Some(Streaming::start(
+            delay,
+            sliding::local(
+                files,
+                self.threads,
+                self.sample.clone(),
+                self.window,
+                self.remix,
+            ),
+        ))
+    }
 }
 
 /// The stage: frames from `input` (the microphone, mono 48 kHz) go to
@@ -114,450 +122,86 @@ pub fn run(
     control: &Control,
     setup: Setup,
 ) {
-    let (jobs, jobs_rx) = mpsc::channel::<Job>();
-    let (done_tx, done) = mpsc::channel::<Done>();
-    thread::spawn(move || worker(&setup, jobs_rx, done_tx));
+    let down = if setup.remote.is_some() {
+        SERVER_DOWN
+    } else {
+        FAILED
+    };
     let _ = stream::realtime(|| {
-        let mut on: Option<On> = None;
-        let mut generation = 0u64;
+        let mut on: Option<Streaming> = None;
         let mut copy = AudioFrame::new(2);
+        let (mut frames, mut late_until) = (0u64, 0u64);
         while !control.stop.load(Relaxed) {
             let Some(frame) = input.pop() else {
                 thread::sleep(Duration::from_millis(1));
                 continue;
             };
+            frames += 1;
             let wanted = control.enabled.load(Relaxed);
             if wanted != on.is_some() {
-                // Switched: start afresh (stale WeSep results are ignored).
-                generation += 1;
-                on = wanted.then(On::new);
+                on = if wanted { setup.start() } else { None };
                 state(if wanted { ON } else { OFF });
-                if wanted {
-                    // Load WeSep and the voice now, not on the first block.
-                    let _ = jobs.send((generation, Instant::now(), Vec::new()));
-                }
             }
             let (out, mic) = match on.as_mut() {
                 None => (frame, frame),
                 Some(s) => {
-                    for (_, warm, result, took) in
-                        done.try_iter().filter(|(g, ..)| *g == generation)
-                    {
-                        match result {
-                            Ok(_) if warm => {}
-                            Err(_) if warm => state(FAILED),
-                            Ok(cleaned) => {
-                                control.handled.fetch_add(BLOCK_FRAMES as u64, Relaxed);
-                                control.busy_us.fetch_add(took.as_micros() as u64, Relaxed);
-                                s.finished(&cleaned);
-                                state(ON);
-                            }
-                            Err(e) if e == SKIPPED => {
-                                state(LATE);
-                                s.finished_raw();
-                            }
-                            Err(_) => {
-                                state(FAILED);
-                                s.finished_raw();
-                            }
-                        }
+                    let (out, mic, status) = s.next(&frame);
+                    let (cleaned, took) = s.take_work();
+                    control.handled.fetch_add(cleaned, Relaxed);
+                    control.busy_us.fetch_add(took.as_micros() as u64, Relaxed);
+                    if status == Status::Late {
+                        late_until = frames + LATE_SHOWN;
                     }
-                    if let Some(block) = s.push(&frame) {
-                        let _ = jobs.send((generation, Instant::now(), block));
-                    }
-                    let (out, mic, late) = s.next(&frame);
-                    if late {
-                        state(LATE);
-                    }
+                    state(match status {
+                        Status::Down => down,
+                        _ if frames < late_until => LATE,
+                        _ => ON,
+                    });
                     (out, mic)
                 }
             };
-            if let Some(t) = tap.as_deref_mut() {
-                for (pair, (m, o)) in copy
-                    .samples_mut()
-                    .as_chunks_mut::<2>()
-                    .0
-                    .iter_mut()
-                    .zip(mic.samples().iter().zip(out.samples()))
-                {
-                    (pair[0], pair[1]) = (*m, *o);
-                }
-                copy.seq = out.seq;
-                let _ = t.push(&copy);
-            }
+            send_tap(tap.as_deref_mut(), &mut copy, &mic, &out);
             let _ = output.push(&out);
         }
         Ok(())
     });
 }
 
+/// A copy for the stage files (stages.rs): stereo, the microphone `mic`
+/// (lined up) and what was sent on, `out`.
+fn send_tap(tap: Option<&mut Producer>, copy: &mut AudioFrame, mic: &AudioFrame, out: &AudioFrame) {
+    if let Some(t) = tap {
+        for (pair, (m, o)) in copy
+            .samples_mut()
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip(mic.samples().iter().zip(out.samples()))
+        {
+            (pair[0], pair[1]) = (*m, *o);
+        }
+        copy.seq = out.seq;
+        let _ = t.push(copy);
+    }
+}
+
 fn state(s: u8) {
     ipc::TELEMETRY.live_tse.store(s, Relaxed);
-}
-
-/// The stage while on.
-struct On {
-    down: Fir,
-    /// The new audio being gathered (48 kHz), and the last second of the
-    /// block before it: the overlap the next chunk starts with, 48 kHz and,
-    /// for WeSep, 16 kHz.
-    block: Vec<f32>,
-    overlap: Vec<f32>,
-    overlap_low: Vec<f32>,
-    /// Microphone frames waiting to be played out (the delay line), and the
-    /// joined audio ready to play, 48 kHz.
-    mics: VecDeque<AudioFrame>,
-    ready: VecDeque<f32>,
-    /// Chunks sent to WeSep and not back yet, as recorded (48 kHz), in case
-    /// WeSep fails on them.
-    pending: VecDeque<Vec<f32>>,
-    /// The last chunk's final second, held back to crossfade with the next
-    /// chunk's first (48 kHz).
-    held: Vec<f32>,
-    /// Microphone audio sent in place of audio that wasn't ready (48 kHz):
-    /// that much of what comes back is past its time and is dropped, so the
-    /// delay stays DELAY_FRAMES.
-    owed: usize,
-}
-
-impl On {
-    fn new() -> On {
-        let mut silent = AudioFrame::new(1);
-        silent.captured = None;
-        On {
-            down: Fir::new(),
-            block: Vec::with_capacity(BLOCK_FRAMES * FRAME),
-            overlap: Vec::new(),
-            overlap_low: Vec::new(),
-            mics: (0..DELAY_FRAMES).map(|_| silent).collect(),
-            ready: VecDeque::from(vec![0.0; DELAY_FRAMES * FRAME]),
-            pending: VecDeque::new(),
-            held: Vec::new(),
-            owed: 0,
-        }
-    }
-
-    /// Queues audio to play, minus what the microphone already stood in for.
-    fn ready(&mut self, audio: impl IntoIterator<Item = f32>) {
-        let mut audio = audio.into_iter();
-        while self.owed > 0 && audio.next().is_some() {
-            self.owed -= 1;
-        }
-        self.ready.extend(audio);
-    }
-
-    /// Adds a microphone frame; once 1 s of new audio is in, returns the
-    /// chunk for WeSep: 16 kHz, the overlap first (none for the first).
-    fn push(&mut self, frame: &AudioFrame) -> Option<Vec<f32>> {
-        self.mics.push_back(*frame);
-        self.block.extend_from_slice(frame.samples());
-        if self.block.len() < BLOCK_FRAMES * FRAME {
-            return None;
-        }
-        let block = std::mem::take(&mut self.block);
-        let low = self.down.filter(&block, DOWN);
-        let job: Vec<f32> = self.overlap_low.iter().chain(&low).copied().collect();
-        let chunk: Vec<f32> = self.overlap.iter().chain(&block).copied().collect();
-        self.overlap_low = low[low.len() - OVERLAP..].to_vec();
-        self.overlap = block[block.len() - OVERLAP * DOWN..].to_vec();
-        self.pending.push_back(chunk);
-        Some(job)
-    }
-
-    /// WeSep's result for the oldest chunk sent (16 kHz, as sent).
-    fn finished(&mut self, cleaned: &[f32]) {
-        let Some(chunk) = self.pending.pop_front() else {
-            return;
-        };
-        // Back to 48 kHz: zeros between the samples, then the same filter as
-        // on the way down.
-        let mut stuffed = vec![0f32; chunk.len()];
-        for (i, v) in cleaned.iter().take(chunk.len() / DOWN).enumerate() {
-            stuffed[i * DOWN] = v * DOWN as f32;
-        }
-        let up = Fir::new().filter(&stuffed, 1);
-        self.join(&up, chunk.len() - BLOCK_FRAMES * FRAME);
-    }
-
-    /// WeSep failed on the oldest chunk: it plays as recorded.
-    fn finished_raw(&mut self) {
-        if let Some(chunk) = self.pending.pop_front() {
-            self.join(&chunk, chunk.len() - BLOCK_FRAMES * FRAME);
-        }
-    }
-
-    /// Joins a chunk (48 kHz) whose first `overlap` samples are the same
-    /// stretch as the last chunk's held end: that stretch crossfaded from the
-    /// last chunk to this one, then this chunk up to its own last second,
-    /// which is held for the next.
-    fn join(&mut self, chunk: &[f32], overlap: usize) {
-        let (head, rest) = chunk.split_at(overlap);
-        let held = std::mem::take(&mut self.held);
-        let n = head.len().min(held.len());
-        let faded: Vec<f32> = (0..n)
-            .map(|i| {
-                let w = (i as f32 + 0.5) / n as f32;
-                held[i] * (1.0 - w) + head[i] * w
-            })
-            .collect();
-        self.ready(faded);
-        let keep = rest.len().saturating_sub(OVERLAP * DOWN);
-        self.ready(rest[..keep].iter().copied());
-        self.held = rest[keep..].to_vec();
-    }
-
-    /// The next frame out (cleaned, DELAY_FRAMES behind `now`), the
-    /// microphone frame it came from, and whether it was late (then it's
-    /// that microphone frame, as recorded).
-    fn next(&mut self, now: &AudioFrame) -> (AudioFrame, AudioFrame, bool) {
-        let mic = self.mics.pop_front().unwrap_or(AudioFrame::new(1));
-        let mut out = AudioFrame::new(1);
-        let late = self.ready.len() < FRAME;
-        if late {
-            // The microphone as recorded goes out instead; what's there is
-            // played next time with the rest, and the frame's worth after it
-            // is owed.
-            out.samples_mut().copy_from_slice(mic.samples());
-            self.owed += FRAME;
-        } else {
-            for s in out.samples_mut() {
-                *s = self.ready.pop_front().unwrap_or(0.0);
-            }
-        }
-        out.seq = now.seq;
-        // The time the audio it holds was captured, so the reported latency
-        // shows the delay.
-        out.captured = mic.captured;
-        (out, mic, late)
-    }
-}
-
-/// Runs WeSep on the blocks from `jobs` (16 kHz, context first), returning
-/// each with how long it took. Loads the model on the first job, and the
-/// voice sample whenever it changes; an empty job only does that (warm: true).
-fn worker(setup: &Setup, jobs: mpsc::Receiver<Job>, done: mpsc::Sender<Done>) {
-    let mut model: Option<tse::Extractor> = None;
-    let mut voice: Option<(Vec<f32>, std::time::SystemTime)> = None;
-    let mut waiting: VecDeque<Job> = VecDeque::new();
-    loop {
-        if waiting.is_empty() {
-            match jobs.recv() {
-                Ok(job) => waiting.push_back(job),
-                Err(_) => return,
-            }
-        }
-        waiting.extend(jobs.try_iter());
-        // A chunk past its time, with a newer one waiting behind it: skip
-        // it, so WeSep catches up instead of making every chunk after it
-        // late too.
-        while waiting.len() > 1
-            && waiting
-                .front()
-                .is_some_and(|(_, sent, m)| !m.is_empty() && sent.elapsed() >= WESEP_TIME)
-        {
-            let (generation, ..) = waiting.pop_front().expect("checked above");
-            let skipped = (generation, false, Err(SKIPPED.to_string()), Duration::ZERO);
-            if done.send(skipped).is_err() {
-                return;
-            }
-        }
-        let (generation, _, mix) = waiting.pop_front().expect("one at least");
-        let (started, warm) = (Instant::now(), mix.is_empty());
-        let result = (|| -> Result<Vec<f32>, String> {
-            if model.is_none() {
-                model = Some(tse::Extractor::load(&setup.files, setup.threads)?);
-            }
-            let m = model.as_mut().expect("loaded above");
-            let modified = std::fs::metadata(&setup.sample)
-                .and_then(|x| x.modified())
-                .map_err(|_| "no voice sample".to_string())?;
-            if voice.as_ref().is_none_or(|(_, at)| *at != modified) {
-                let b = std::fs::read(&setup.sample).map_err(|e| e.to_string())?;
-                let samples: Vec<f32> = b
-                    .get(44..)
-                    .unwrap_or_default()
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|&c| f32::from(i16::from_le_bytes(c)) / 32768.0)
-                    .collect();
-                voice = Some((m.enroll(&samples)?, modified));
-            }
-            if warm {
-                return Ok(Vec::new());
-            }
-            let embedding = &voice.as_ref().expect("enrolled above").0;
-            let est = m.extract(embedding, &mix)?;
-            Ok(tse::remix(&est, &mix, 0.0))
-        })();
-        if done
-            .send((generation, warm, result, started.elapsed()))
-            .is_err()
-        {
-            return;
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::enhance::Fir;
+    use std::sync::mpsc;
+    use std::time::Instant;
 
-    fn tone_frame(k: usize) -> AudioFrame {
-        let mut f = AudioFrame::new(1);
-        f.seq = k as u64;
-        for (i, s) in f.samples_mut().iter_mut().enumerate() {
-            let t = (k * FRAME + i) as f32 / 48_000.0;
-            *s = 0.3 * (std::f32::consts::TAU * 440.0 * t).sin();
-        }
-        f
-    }
-
-    #[test]
-    fn on_plays_blocks_a_fixed_delay_behind() {
-        let mut s = On::new();
-        let mut sent = Vec::new();
-        let mut outs = Vec::new();
-        for k in 0..DELAY_FRAMES + 2 * BLOCK_FRAMES {
-            if let Some(job) = s.push(&tone_frame(k)) {
-                // A chunk: the overlap (none for the first), then 1 s new, 16 kHz.
-                let ctx = if sent.is_empty() { 0 } else { OVERLAP };
-                assert_eq!(job.len(), ctx + BLOCK_FRAMES * FRAME / DOWN);
-                sent.push(job);
-                // "WeSep" hands it straight back, unchanged.
-                let job = sent.last().unwrap().clone();
-                s.finished(&job);
-            }
-            outs.push(s.next(&tone_frame(k)));
-        }
-        // The first DELAY_FRAMES are silence; then the microphone, delayed.
-        assert!(
-            outs[..DELAY_FRAMES]
-                .iter()
-                .all(|(o, _, late)| !late && o.samples().iter().all(|&v| v == 0.0))
-        );
-        for (k, (out, mic, late)) in outs.iter().enumerate().skip(DELAY_FRAMES + 10) {
-            assert!(!late, "frame {k} late");
-            let expected = tone_frame(k - DELAY_FRAMES);
-            assert_eq!(
-                mic.samples(),
-                expected.samples(),
-                "the delay line, frame {k}"
-            );
-            // Down and back up: the same tone, a little filter delay apart.
-            let level = |x: &[f32]| (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt();
-            let ratio = level(out.samples()) / level(expected.samples());
-            assert!((ratio - 1.0).abs() < 0.05, "frame {k}: level ratio {ratio}");
-        }
-    }
-
-    #[test]
-    fn a_block_wesep_misses_or_late_plays_as_recorded() {
-        let mut s = On::new();
-        let mut outs = Vec::new();
-        for k in 0..DELAY_FRAMES + BLOCK_FRAMES + 5 {
-            if s.push(&tone_frame(k)).is_some() {
-                s.finished_raw();
-            }
-            outs.push(s.next(&tone_frame(k)));
-        }
-        let (out, _, late) = &outs[DELAY_FRAMES + 3];
-        assert!(!late);
-        assert_eq!(out.samples(), tone_frame(3).samples());
-        // Nothing more came back: the frames after the block are late.
-        let mut s = On::new();
-        for k in 0..DELAY_FRAMES {
-            s.push(&tone_frame(k));
-            s.next(&tone_frame(k));
-        }
-        // Late: the microphone it came from, as recorded, instead.
-        let (out, _, late) = s.next(&tone_frame(DELAY_FRAMES));
-        assert!(late);
-        assert_eq!(out.samples(), tone_frame(0).samples());
-    }
-
-    #[test]
-    fn chunks_are_1_5_s_overlapping_by_0_5_s_and_crossfaded() {
-        // A steady level, and a "WeSep" that scales chunk k by 1 + k / 10:
-        // which chunk each moment came from shows in its level.
-        let level = |k: usize| {
-            let mut f = AudioFrame::new(1);
-            f.seq = k as u64;
-            f.samples_mut().fill(0.1);
-            f
-        };
-        let gain = |k: usize| 1.0 + k as f32 / 10.0;
-        let mean = |x: &[f32]| x.iter().sum::<f32>() / x.len() as f32;
-        let mut s = On::new();
-        let (mut chunks, mut outs) = (0, Vec::new());
-        for k in 0..DELAY_FRAMES + 5 * BLOCK_FRAMES {
-            if let Some(job) = s.push(&level(k)) {
-                // 1.5 s each, the first 1 s (it has nothing before it).
-                let secs = job.len() as f32 / 16_000.0;
-                assert_eq!(secs, if chunks == 0 { 1.0 } else { 1.5 });
-                let g = gain(chunks);
-                s.finished(&job.iter().map(|v| v * g).collect::<Vec<_>>());
-                chunks += 1;
-            }
-            outs.push(s.next(&level(k)).0);
-        }
-        // The microphone's frame m plays at m + DELAY_FRAMES. Chunk k (k > 0)
-        // covers frames 100k - 50 to 100k + 100: its own half second in the
-        // middle at its own level, the half second before it halfway through
-        // the crossfade from chunk k - 1.
-        let (b, half) = (BLOCK_FRAMES, OVERLAP_FRAMES / 2);
-        let at = |m: usize| mean(outs[m + DELAY_FRAMES].samples()) / 0.1;
-        assert!((at(half) - gain(0)).abs() < 0.01, "{}", at(half));
-        for k in 1..4 {
-            let own = at(b * k + half);
-            assert!((own - gain(k)).abs() < 0.01, "chunk {k}: {own}");
-            let fade = at(b * k - half);
-            let between = (gain(k - 1) + gain(k)) / 2.0;
-            assert!((fade - between).abs() < 0.01, "chunk {k} crossfade: {fade}");
-        }
-    }
-
-    #[test]
-    fn a_late_block_does_not_add_to_the_delay() {
-        // A slow ramp: each moment has its own level.
-        let ramp = |k: usize| {
-            let mut f = AudioFrame::new(1);
-            f.seq = k as u64;
-            for (i, s) in f.samples_mut().iter_mut().enumerate() {
-                *s = (k * FRAME + i) as f32 / 48_000.0 * 0.1;
-            }
-            f
-        };
-        let mean = |x: &[f32]| x.iter().sum::<f32>() / x.len() as f32;
-        let mut s = On::new();
-        let mut held = Vec::new();
-        let mut outs = Vec::new();
-        for k in 0..DELAY_FRAMES + 3 * BLOCK_FRAMES {
-            if let Some(job) = s.push(&ramp(k)) {
-                held.push(job);
-            }
-            // The first block comes back 50 frames late, the rest on time.
-            if k >= DELAY_FRAMES + 50 {
-                for job in held.drain(..) {
-                    s.finished(&job);
-                }
-            }
-            outs.push(s.next(&ramp(k)));
-        }
-        let late = outs.iter().filter(|(.., late)| *late).count();
-        assert_eq!(late, 50);
-        // After the gap: the microphone, still DELAY_FRAMES behind, and the
-        // cleaned audio of that same moment (0.005 is 50 frames of ramp).
-        for (k, (out, mic, late)) in outs.iter().enumerate().skip(DELAY_FRAMES + 60) {
-            assert!(!late, "frame {k} late");
-            assert_eq!(mic.samples(), ramp(k - DELAY_FRAMES).samples());
-            let off = mean(out.samples()) - mean(mic.samples());
-            assert!(off.abs() < 0.0005, "frame {k}: {off}");
-        }
-    }
+    const DOWN: usize = 3;
+    const FRAME: usize = 480;
 
     /// The live chain on a real recording, in real time, as in the app: this
-    /// stage (today's WeSep, 1.5 s chunks overlapping by 0.5 s), then
+    /// stage (WeSep on the sliding window, on this PC's CPU, or with
+    /// YAL_LIVETSE_REMOTE on a voice server), then
     /// DeepFilterNet3. YAL_LIVETSE_TEST="<dir with onnxruntime.dll and
     /// wesep\\>|<voice sample>|<recording>|<out folder>", YAL_LIVETSE_DFN =
     /// DeepFilterNet3_onnx.tar.gz. Saves input.m4a, audio_tse.m4a and
@@ -580,11 +224,29 @@ mod tests {
         let enrolled = crate::audiofile::read(Path::new(sample)).unwrap();
         std::fs::write(&voice, crate::record::wav_bytes(&enrolled)).unwrap();
         let setup = Setup {
-            files: tse::Files::find(Path::new(dir)).expect("WeSep files"),
+            files: Some(tse::Files::find(Path::new(dir)).expect("WeSep files")),
             threads: std::env::var("YAL_LIVETSE_THREADS")
                 .map_or(threads(2), |t| t.parse().unwrap()),
             sample: voice.clone(),
+            // YAL_LIVETSE_REMOTE: a settings.ini with a `[voice]` url, for
+            // WeSep on that server instead (remote_tse.rs).
+            remote: std::env::var("YAL_LIVETSE_REMOTE").ok().map(|ini| {
+                remote_tse::Settings::parse(&std::fs::read_to_string(ini).unwrap())
+                    .expect("a [voice] url")
+            }),
+            // YAL_LIVETSE_INI: a settings.ini with the window's `[voice]`
+            // settings for this PC.
+            window: Window::parse(
+                &std::env::var("YAL_LIVETSE_INI")
+                    .map(|ini| std::fs::read_to_string(ini).unwrap())
+                    .unwrap_or_default(),
+                CPU_BUDGET_MS,
+            ),
+            remix: 0.0,
         };
+        // How far behind the microphone the step plays.
+        let skip = setup.delay_frames();
+        let shape = setup.remote.as_ref().map_or(setup.window, |r| r.window);
         let model = std::env::var("YAL_LIVETSE_DFN").expect("set YAL_LIVETSE_DFN");
         // 48 kHz: each 16 kHz sample three times, then smoothed.
         let mix = crate::audiofile::read(Path::new(recording)).unwrap();
@@ -606,7 +268,7 @@ mod tests {
         // DeepFilterNet3.
         let (mut tse_tap_tx, mut tse_tap_rx) = ring::new(1024);
         let (mut se_tap_tx, mut se_tap_rx) = ring::new(1024);
-        let total = frames + DELAY_FRAMES;
+        let total = frames + skip;
         let mut stages = vec![[[0f32; FRAME]; 3]; total];
         let mut late = Vec::new();
         let (models, models_rx) = mpsc::channel();
@@ -636,6 +298,10 @@ mod tests {
                     }
                 }
             };
+            // YAL_LIVETSE_SLOWER: feed the recording this many times slower
+            // than real time (what WeSep would give on a faster computer).
+            let pace =
+                10 * std::env::var("YAL_LIVETSE_SLOWER").map_or(1, |x| x.parse::<u64>().unwrap());
             let mut started = Instant::now();
             for k in 0..total {
                 let mut f = AudioFrame::new(1);
@@ -651,7 +317,7 @@ mod tests {
                     thread::sleep(Duration::from_secs(3));
                     started = Instant::now() - Duration::from_millis(10);
                 }
-                let due = started + Duration::from_millis(10 * (k as u64 + 1));
+                let due = started + Duration::from_millis(pace * (k as u64 + 1));
                 thread::sleep(due.saturating_duration_since(Instant::now()));
                 collect(&mut stages);
                 if ipc::TELEMETRY.live_tse.load(Relaxed) == LATE {
@@ -690,7 +356,7 @@ mod tests {
         // Each stage at 16 kHz, from the recording's start (the frames after
         // the delay).
         for (i, name) in ["input", "audio_tse", "audio_tse_se"].iter().enumerate() {
-            let x: Vec<f32> = stages[DELAY_FRAMES..].iter().flat_map(|st| st[i]).collect();
+            let x: Vec<f32> = stages[skip..].iter().flat_map(|st| st[i]).collect();
             let x: Vec<i16> = Fir::new()
                 .filter(&x[..x.len() / DOWN * DOWN], DOWN)
                 .iter()
@@ -702,11 +368,14 @@ mod tests {
             out.join("rtf.csv"),
             format!(
                 "step,audio_s,time_s,rtf,note\n\
-                 tse,{:.2},{:.3},{:.3},WeSep 1.5 s chunks overlapping 0.5 s; {} of {frames} frames late (played as recorded)\n\
+                 tse,{:.2},{:.3},{:.3},WeSep sliding window {} ms + {} ms hop + {} ms lookahead; {} of {frames} frames late (played as recorded)\n\
                  se,{:.2},{:.3},{:.3},DeepFilterNet3 15 dB\n",
                 tse_rtf.0,
                 tse_rtf.1,
                 tse_rtf.2,
+                shape.context_ms,
+                shape.hop_ms,
+                shape.lookahead_ms,
                 late.len(),
                 se_rtf.0,
                 se_rtf.1,

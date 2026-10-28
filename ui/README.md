@@ -102,26 +102,38 @@ transcript listens to it too, by loopback of VB-CABLE, like the customer's
 side from the headset.
 
 The TSE step is WeSep, on by default (the window's **Voice filter (WeSep)**
-box, shown when the WeSep files ship with the engine, switches it off and
-on). WeSep's public model looks at audio after each moment as well as
-before, so it can't work moment by moment: the step runs it on the
-microphone chunk by chunk, as the team's `run_tse.sh --chunk_sec 1.5
---overlap_sec 0.5`: 1.5 s chunks overlapping by 0.5 s, each sent to WeSep
-as soon as it's gathered, the overlapping half second crossfaded from one
-chunk's output to the next. Then DeepFilterNet3 does speech enhancement, as
-`run_se.sh` (MossFormer2 is too heavy for the agents' laptops). The result
-plays 3 s behind: the customer hears the agent 3 s late (1 s of new audio
-per chunk, up to 1.5 s for WeSep, and 0.5 s held back for the crossfade).
-Shorter chunks separate less (2 s pieces barely did); a causal (live)
-target speaker model would take WeSep's place with about 30 ms of delay
-(docs/causal-tse-training.md).
+box, shown when the WeSep files ship with the engine or a voice server is
+set, switches it off and on). WeSep's public model looks at audio after
+each moment as well as before, so the step runs it on a sliding window:
 
-A chunk WeSep hasn't finished in time goes out as recorded (the window
-shows "PC too slow"), and the delay stays 3 s; when WeSep falls behind it
-skips chunks already past their time to catch up. One it fails on (no voice
-sample, say) goes out as recorded too. Unticking the box goes back to
-DeepFilterNet3 alone at once. WeSep gets half the PC's logical processors,
-2 to 4 (or `[voice] threads`, if more).
+    |<------ left context (2.0 s) ------>|<- hop (0.32 s) ->|<- lookahead (0.2 s) ->|
+    model input = the whole window; output = only the hop
+
+Every hop, once the lookahead after it has come in, WeSep runs on the whole
+window and only the hop is kept, its first 20 ms crossfaded with the window
+before's version. The lookahead keeps the hop away from the end of the
+model's input, where it's weakest. Then DeepFilterNet3 does speech
+enhancement, as `run_se.sh` (MossFormer2 is too heavy for the agents'
+laptops). The hops play a fixed delay behind the microphone: hop +
+lookahead + `budget_ms`, the time allowed for the compute.
+
+- **With a GPU voice server** (`[voice]` url; voice-server/README.md),
+  WeSep runs there: about **0.67 s** late, every hop cleaned.
+- **On this PC's CPU** (no server), `budget_ms` is 1800: about **2.3 s**
+  late. A laptop CPU takes longer than a hop for each window (about 1 s on
+  the development PC's i5-12450H on mains, 3 s of compute per second of
+  audio), so WeSep cleans the newest hop that's ready each time, about one
+  in three, and the others play as recorded; the window shows "PC too
+  slow". Given the time (fed 4 times slower than real time), every hop is
+  cleaned and the colleague in the team's InputMixx recording is turned
+  down as much as on the server (9-11 dB in their clearest seconds).
+
+The window settings are in `[voice]`: `context_ms`, `hop_ms`,
+`lookahead_ms`, `budget_ms`. A hop not ready in time (or WeSep unable to
+run: no voice sample, server unreachable) goes out as recorded, and the
+delay stays the same. Unticking the box goes back to DeepFilterNet3 alone
+at once. On this PC, WeSep gets half the logical processors, 2 to 4 (or
+`[voice] threads`, if more).
 
 While a call is recorded, the agent's own voice is saved at each step of the
 live chain, each covering the same stretch, in a folder per call,

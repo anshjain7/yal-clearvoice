@@ -23,7 +23,9 @@ use clearvoice::ipc::{self, TELEMETRY, UiCommand};
 use clearvoice::livetse;
 use clearvoice::playback::Speaker;
 use clearvoice::record;
+use clearvoice::remote_tse;
 use clearvoice::ring;
+use clearvoice::sliding;
 use clearvoice::stages;
 use clearvoice::stream::{self, supervise};
 use clearvoice::transcribe::{self, Side};
@@ -245,14 +247,26 @@ fn main() {
         });
     }
     // Live TSE (livetse.rs): WeSep between the microphone and noise removal,
-    // for the customer and the transcript. On at start; the window can
+    // for the customer and the transcript, on a GPU voice server when there's
+    // one (remote_tse.rs), else on this PC. On at start; the window can
     // switch it off.
-    let live_setup = tse::Files::find(&exe_dir).map(|files| livetse::Setup {
+    let remote = remote_tse::Settings::parse(&ini);
+    let files = tse::Files::find(&exe_dir);
+    let (remix, threads) = voice::local_options(&ini);
+    let live_setup = (files.is_some() || remote.is_some()).then(|| livetse::Setup {
         files,
-        threads: livetse::threads(voice::local_options(&ini).1),
+        threads: livetse::threads(threads),
         sample: voice::sample_path(),
+        remote: remote.clone(),
+        window: sliding::Window::parse(&ini, livetse::CPU_BUDGET_MS),
+        remix,
     });
     let has_live = live_setup.is_some();
+    if let Some(setup) = &live_setup {
+        TELEMETRY
+            .live_tse_delay_ms
+            .store(setup.delay_frames() as u64 * 10, Relaxed);
+    }
     TELEMETRY.live_tse.store(
         if has_live {
             livetse::ON
@@ -371,10 +385,13 @@ fn main() {
             for (side, endpoint) in [(Side::Customer, customer), (Side::Agent, cable_input)] {
                 let (tx, rx) = mpsc::channel();
                 s.spawn(move || transcribe::listen(Direction::Output, endpoint, tx, listen_stop));
-                // A voice server still cleans the agent's side for the
-                // transcript; on this PC, extraction moves into the live chain.
+                // A voice server not streaming still cleans the agent's side
+                // for the transcript; streaming, or on this PC, extraction is
+                // in the live chain the transcript listens to.
                 let rx = match (&voice_backend, side) {
-                    (Some(backend @ voice::Backend::Server(_)), Side::Agent) => {
+                    (Some(backend @ voice::Backend::Server(_)), Side::Agent)
+                        if remote.is_none() =>
+                    {
                         let (clean_tx, clean_rx) = mpsc::channel();
                         s.spawn(move || voice::clean(backend, rx, clean_tx));
                         clean_rx

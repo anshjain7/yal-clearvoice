@@ -414,6 +414,17 @@ pub(crate) fn below_normal_priority() {
     let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
 }
 
+/// The server's id for the voice sample at `sample`, sending it (POST
+/// /enroll); for the live stream (remote_tse.rs).
+pub(crate) fn enroll(settings: &Settings, sample: &Path) -> Result<String, String> {
+    Client::new(settings.clone(), sample.to_path_buf()).enroll()
+}
+
+/// The server's host name, from its url.
+pub(crate) fn host(settings: &Settings) -> Option<String> {
+    Url::parse(&settings.url).ok().map(|u| u.host)
+}
+
 /// Talks to the extraction server.
 struct Client {
     settings: Settings,

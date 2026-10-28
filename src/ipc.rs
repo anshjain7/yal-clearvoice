@@ -78,6 +78,8 @@ pub struct Telemetry {
     pub voice: AtomicU64,
     /// Live TSE's state: livetse::OFF, ON, FAILED, LATE or UNAVAILABLE.
     pub live_tse: AtomicU8,
+    /// How far behind the microphone live TSE plays, ms (for the window).
+    pub live_tse_delay_ms: AtomicU64,
     /// End-to-end send-path latency, microseconds (set by the virtual mic).
     pub latency_us: AtomicU64,
     /// DeepFilterNet per-frame processing time, microseconds.
@@ -118,6 +120,7 @@ impl Telemetry {
             dfn_state: AtomicU8::new(DFN_BYPASS),
             voice: AtomicU64::new(VOICE_OFF),
             live_tse: AtomicU8::new(4),
+            live_tse_delay_ms: AtomicU64::new(0),
             notice: AtomicU8::new(NOTICE_NONE),
             latency_us: AtomicU64::new(0),
             busy_us: AtomicU64::new(0),
@@ -392,7 +395,7 @@ fn telemetry_json() -> String {
         "{{\"type\":\"telemetry\",\"mic_connected\":{},\"spk_connected\":{},\
          \"spk_selectable\":{},\"nc\":{},\"dfn\":\"{}\",\"notice\":{},\"latency_ms\":{},\
          \"processing_ms\":{:.2},\"cpu_pct\":{},\"errors\":{},\"strength_supported\":false,\
-         \"mic_name\":\"{}\",\"headset_name\":\"{}\",\"voice\":\"{}\",\"live_tse\":\"{}\"}}",
+         \"mic_name\":\"{}\",\"headset_name\":\"{}\",\"voice\":\"{}\",\"live_tse\":\"{}\",\"live_tse_delay_ms\":{}}}",
         TELEMETRY.mic_connected.load(Relaxed),
         TELEMETRY.spk_connected.load(Relaxed),
         TELEMETRY.spk_selectable.load(Relaxed),
@@ -407,6 +410,7 @@ fn telemetry_json() -> String {
         escape(&headset_name),
         voice_name(TELEMETRY.voice.load(Relaxed)),
         live_tse_name(TELEMETRY.live_tse.load(Relaxed)),
+        TELEMETRY.live_tse_delay_ms.load(Relaxed),
     )
 }
 
@@ -416,6 +420,7 @@ fn live_tse_name(state: u8) -> &'static str {
         1 => "on",
         2 => "failed",
         3 => "late",
+        5 => "server_down",
         _ => "unavailable",
     }
 }
